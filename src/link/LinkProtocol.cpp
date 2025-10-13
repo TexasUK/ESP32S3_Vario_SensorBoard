@@ -1,199 +1,174 @@
 #include "LinkProtocol.h"
 
-void LinkProtocol::begin(uint32_t baud, int8_t rxPin, int8_t txPin) {
-  ser_ = &Serial1; // Use UART1 for link communication
-  ser_->begin(baud, SERIAL_8N1, rxPin, txPin);
-}
+// ============================ TX ===================================
 
-// ==================== SENDING METHODS ====================
+bool LinkProtocol::writeFrame_(uint8_t id, const uint8_t* payload, uint8_t len) {
+  if (!serial_) return false;
+  uint8_t csum = calcCsum_(id, len, payload);
 
-void LinkProtocol::sendTelemetry(const TelemetryMsg& m) {
-  sendFrame(FT_TELEMETRY, (const uint8_t*)&m, sizeof(TelemetryMsg));
-}
-
-void LinkProtocol::sendTouch(uint16_t type, uint16_t x, uint16_t y) {
-  TouchMsg msg = {type, x, y};
-  sendFrame(FT_TOUCH, (const uint8_t*)&msg, sizeof(TouchMsg));
-}
-
-void LinkProtocol::sendSettingChange(uint8_t id, int32_t value) {
-  SettingChangeMsg msg = {id, value};
-  sendFrame(FT_SETTING_CHANGE, (const uint8_t*)&msg, sizeof(SettingChangeMsg));
-}
-
-void LinkProtocol::sendFrame(uint8_t type, const uint8_t* payload, size_t len) {
-  if (!ser_) return;
-  
-  // Calculate CRC (include type in CRC calculation)
-  uint16_t crc = crc16(&type, 1);
-  crc = crc16(payload, len, crc);
-  
-  // SLIP encode and send frame
-  ser_->write(FEND);
-  
-  // Send type
-  slipPush(type);
-  
-  // Send payload
-  for (size_t i = 0; i < len; i++) {
-    slipPush(payload[i]);
-  }
-  
-  // Send CRC (little-endian)
-  slipPush(crc & 0xFF);
-  slipPush((crc >> 8) & 0xFF);
-  
-  ser_->write(FEND);
-}
-
-void LinkProtocol::slipPush(uint8_t c) {
-  if (c == FEND) {
-    ser_->write(FESC);
-    ser_->write(TFEND);
-  } else if (c == FESC) {
-    ser_->write(FESC);
-    ser_->write(TFESC);
-  } else {
-    ser_->write(c);
-  }
-}
-
-// ==================== RECEIVING METHODS ====================
-
-bool LinkProtocol::pollTelemetry(TelemetryMsg& out) {
-  uint8_t type;
-  const uint8_t* payload;
-  size_t plen;
-  
-  if (pollFrame(type, payload, plen)) {
-    if (type == FT_TELEMETRY && plen == sizeof(TelemetryMsg)) {
-      memcpy(&out, payload, sizeof(TelemetryMsg));
-      return true;
-    }
-  }
-  return false;
-}
-
-bool LinkProtocol::pollTouch(TouchMsg& out) {
-  uint8_t type;
-  const uint8_t* payload;
-  size_t plen;
-  
-  if (pollFrame(type, payload, plen)) {
-    if (type == FT_TOUCH && plen == sizeof(TouchMsg)) {
-      memcpy(&out, payload, sizeof(TouchMsg));
-      return true;
-    }
-  }
-  return false;
-}
-
-bool LinkProtocol::pollSettingChange(SettingChangeMsg& out) {
-  uint8_t type;
-  const uint8_t* payload;
-  size_t plen;
-  
-  if (pollFrame(type, payload, plen)) {
-    if (type == FT_SETTING_CHANGE && plen == sizeof(SettingChangeMsg)) {
-      memcpy(&out, payload, sizeof(SettingChangeMsg));
-      return true;
-    }
-  }
-  return false;
-}
-
-// ==================== SLIP RECEIVE LOGIC ====================
-
-bool LinkProtocol::pollFrame(uint8_t& type, const uint8_t*& pay, size_t& plen) {
-  static bool esc = false;
-  
-  while (ser_ && ser_->available()) {
-    uint8_t b = ser_->read();
-    
-    if (!in_frame_) {
-      if (b == FEND) {
-        in_frame_ = true;
-        rxlen_ = 0;
-        esc = false;
-      }
-      continue;
-    }
-    
-    if (esc) {
-      if (b == TFEND) b = FEND;
-      else if (b == TFESC) b = FESC;
-      else {
-        // Invalid escape sequence
-        in_frame_ = false;
-        rxlen_ = 0;
-        esc = false;
-        continue;
-      }
-      esc = false;
-    } else if (b == FESC) {
-      esc = true;
-      continue;
-    } else if (b == FEND) {
-      // End of frame
-      if (rxlen_ >= 3) { // Need at least type + 2 byte CRC
-        // Parse the frame
-        uint8_t* p = rxbuf_;
-        size_t n = rxlen_;
-        if (tryParse(p, n, type, pay, plen)) {
-          in_frame_ = false;
-          rxlen_ = 0;
-          return true;
-        }
-      }
-      in_frame_ = false;
-      rxlen_ = 0;
-      esc = false;
-      continue;
-    }
-    
-    // Add to buffer if space
-    if (rxlen_ < RX_MAX) {
-      rxbuf_[rxlen_++] = b;
-    } else {
-      // Buffer overflow
-      in_frame_ = false;
-      rxlen_ = 0;
-      esc = false;
-    }
-  }
-  return false;
-}
-
-bool LinkProtocol::tryParse(uint8_t*& p, size_t& n, uint8_t& type, const uint8_t*& pay, size_t& plen) {
-  if (n < 3) return false; // Need type + 2 byte CRC
-  
-  // Extract type (first byte)
-  type = p[0];
-  
-  // Calculate payload length (everything except type and 2-byte CRC)
-  plen = n - 3;
-  pay = &p[1];
-  
-  // Verify CRC
-  uint16_t calc_crc = crc16(&type, 1);
-  calc_crc = crc16(pay, plen, calc_crc);
-  uint16_t recv_crc = (uint16_t)p[1+plen] | ((uint16_t)p[1+plen+1] << 8);
-  
-  if (calc_crc != recv_crc) {
-    return false;
-  }
-  
+  serial_->write(0xAA);
+  serial_->write(id);
+  serial_->write(len);
+  if (len && payload) serial_->write(payload, len);
+  serial_->write(csum);
+  serial_->flush(); // keep it simple
   return true;
 }
 
-// ==================== CRC16 IMPLEMENTATION ====================
+bool LinkProtocol::sendTelemetry(const TelemetryMsg& m) {
+  // Always send v2 (24B) from the *sender* firmware.
+  return writeFrame_(MSG_TELEMETRY, reinterpret_cast<const uint8_t*>(&m), (uint8_t)sizeof(TelemetryMsg));
+}
 
-uint16_t LinkProtocol::crc16(const uint8_t* d, size_t n, uint16_t crc) {
-  while (n--) {
-    crc ^= (uint16_t)(*d++) << 8;
-    for (int i = 0; i < 8; ++i) {
-      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+bool LinkProtocol::sendQNH(uint32_t pa) {
+  uint8_t buf[5];
+  buf[0] = C3_SET_QNH_PA;
+  memcpy(&buf[1], &pa, 4);
+  return writeFrame_(MSG_SETTING_CHANGE, buf, sizeof(buf));
+}
+
+bool LinkProtocol::sendPolarSelect(uint8_t idx) {
+  uint8_t buf[5];
+  buf[0] = C3_SET_POLAR;
+  int32_t v = (int32_t)idx;
+  memcpy(&buf[1], &v, 4);
+  return writeFrame_(MSG_SETTING_CHANGE, buf, sizeof(buf));
+}
+
+bool LinkProtocol::sendTEToggle(bool enabled) {
+  uint8_t buf[5];
+  buf[0] = C3_TE_TOGGLE;
+  int32_t v = enabled ? 1 : 0;
+  memcpy(&buf[1], &v, 4);
+  return writeFrame_(MSG_SETTING_CHANGE, buf, sizeof(buf));
+}
+
+bool LinkProtocol::sendVolume(uint8_t vol01) {
+  if (vol01 > 10) vol01 = 10;
+  uint8_t buf[5];
+  buf[0] = C3_SET_VOLUME;
+  int32_t v = (int32_t)vol01;
+  memcpy(&buf[1], &v, 4);
+  return writeFrame_(MSG_SETTING_CHANGE, buf, sizeof(buf));
+}
+
+bool LinkProtocol::sendBrightness(uint8_t bri01) {
+  if (bri01 > 10) bri01 = 10;
+  uint8_t buf[5];
+  buf[0] = C3_SET_BRIGHTNESS;
+  int32_t v = (int32_t)bri01;
+  memcpy(&buf[1], &v, 4);
+  return writeFrame_(MSG_SETTING_CHANGE, buf, sizeof(buf));
+}
+
+// ============================ RX ===================================
+
+void LinkProtocol::pump_() {
+  if (!serial_) return;
+
+  while (serial_->available()) {
+    uint8_t b = (uint8_t)serial_->read();
+
+    switch (rxState_) {
+      case RX_SYNC:
+        if (b == 0xAA) {
+          rxState_ = RX_ID;
+        }
+        break;
+
+      case RX_ID:
+        rxId_ = b;
+        rxState_ = RX_LEN;
+        break;
+
+      case RX_LEN:
+        rxLen_ = b;
+        if (rxLen_ > sizeof(rxBuf_)) {
+          // invalid length; drop frame
+          resetRx_();
+          break;
+        }
+        rxPos_ = 0;
+        rxState_ = (rxLen_ == 0) ? RX_CSUM : RX_PAYLOAD;
+        break;
+
+      case RX_PAYLOAD:
+        rxBuf_[rxPos_++] = b;
+        if (rxPos_ >= rxLen_) {
+          rxState_ = RX_CSUM;
+        }
+        break;
+
+      case RX_CSUM: {
+        uint8_t expect = calcCsum_(rxId_, rxLen_, rxBuf_);
+        if (expect == b) {
+          onFrame_(rxId_, rxBuf_, rxLen_);
+        }
+        // good or bad checksum, restart
+        resetRx_();
+        break;
+      }
     }
   }
-  return crc;
+}
+
+void LinkProtocol::onFrame_(uint8_t id, const uint8_t* p, uint8_t len) {
+  switch (id) {
+    case MSG_TELEMETRY: {
+      TelemetryMsg t{};
+      if (decodeTelemetryPayload(p, len, t)) {
+        tlm_ = t;
+        haveTlm_ = true;
+      }
+    } break;
+
+    case MSG_TOUCH: {
+      if (len == 5) {
+        TouchMsg tm{};
+        memcpy(&tm.x,   p + 0, 2);
+        memcpy(&tm.y,   p + 2, 2);
+        tm.type = p[4];
+        touch_ = tm;
+        haveTouch_ = true;
+      }
+    } break;
+
+    case MSG_SETTING_CHANGE: {
+      if (len == 5) {
+        SettingChangeMsg sc{};
+        sc.id = p[0];
+        memcpy(&sc.value, p + 1, 4);
+        set_ = sc;
+        haveSet_ = true;
+      }
+    } break;
+
+    default:
+      // ignore unknown ids
+      break;
+  }
+}
+
+bool LinkProtocol::pollTelemetry(TelemetryMsg& out) {
+  pump_();
+  if (!haveTlm_) return false;
+  out = tlm_;
+  haveTlm_ = false; // consume
+  return true;
+}
+
+bool LinkProtocol::pollTouch(TouchMsg& out) {
+  pump_();
+  if (!haveTouch_) return false;
+  out = touch_;
+  haveTouch_ = false;
+  return true;
+}
+
+bool LinkProtocol::pollSettingChange(SettingChangeMsg& out) {
+  pump_();
+  if (!haveSet_) return false;
+  out = set_;
+  haveSet_ = false;
+  return true;
 }
