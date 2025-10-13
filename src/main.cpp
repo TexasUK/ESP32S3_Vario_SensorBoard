@@ -461,10 +461,10 @@ static void writeBootLog() {
   bootLog.printf("Audio Volume: %d/10\n", cfg.audioVolume);
   bootLog.printf("Display Brightness: %d/10\n", cfg.displayBrightness);
   bootLog.printf("SD Card: %s\n", sdMounted ? "Mounted" : "Not mounted");
-  bootLog.printf("BMP581: %s\n", bmp.begin() ? "OK" : "Failed");
+  bootLog.printf("BMP581: %s\n", bmp.performReading() ? "OK" : "Failed");
   bootLog.printf("GPS: UART2 @9600 on pins 4/5\n");
   bootLog.printf("CSV Link: UART1 @115200 on pins 44/43\n");
-  bootLog.printf("BLE: Advertising 'Vario-C3'\n");
+  bootLog.printf("BLE: Advertising 'FlightCore'\n");
   bootLog.printf("Sea Level Pressure: %.1f Pa\n", seaLevelPa);
   bootLog.printf("Initial Altitude: %.1f m\n", alt_m);
   bootLog.println("=== End Boot Log ===");
@@ -811,7 +811,7 @@ static void bleUpdateStateChar() {
 }
 
 static void setupBLE() {
-  NimBLEDevice::init("Vario-C3");                   // shows up by name
+  NimBLEDevice::init("FlightCore");                  // device name
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);           // max practical TX power
 
   bleServer = NimBLEDevice::createServer();
@@ -855,8 +855,11 @@ static void setupBLE() {
 
   NimBLEAdvertising* ad = NimBLEDevice::getAdvertising();
   ad->addServiceUUID(svc->getUUID());  // advertise service UUID
+  ad->setScanResponse(true);           // enable scan response for device name
+  ad->setMinPreferred(0x06);           // functions that help with iPhone connections issue
+  ad->setMaxPreferred(0x12);
   ad->start();
-  Serial.println("[BLE] Advertising 'Vario-C3' with config service");
+  Serial.println("[BLE] Advertising 'FlightCore' with config service");
 }
 
 // -------------------- Arduino --------------------
