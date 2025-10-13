@@ -855,9 +855,9 @@ static void setupBLE() {
 
   NimBLEAdvertising* ad = NimBLEDevice::getAdvertising();
   ad->addServiceUUID(svc->getUUID());  // advertise service UUID
-  ad->setScanResponse(true);           // enable scan response for device name
-  ad->setMinPreferred(0x06);           // functions that help with iPhone connections issue
-  ad->setMaxPreferred(0x12);
+  ad->setScanResponseData(NimBLEAdvertisementData()); // enable scan response for device name
+  ad->setMinInterval(0x06);            // functions that help with iPhone connections issue
+  ad->setMaxInterval(0x12);
   ad->start();
   Serial.println("[BLE] Advertising 'FlightCore' with config service");
 }
