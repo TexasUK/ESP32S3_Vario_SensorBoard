@@ -21,6 +21,17 @@
 #include <NimBLEDevice.h>   // === BLE (NimBLE) ===
 #include "CsvSerial.h"      // CSV link helper
 
+// === WiFi & OTA ===
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoOTA.h>
+#include <Update.h>
+
+// -------------------- Function Declarations --------------------
+static void startWiFiOTA();
+static void stopWiFiOTA();
+static void handleOTA();
+
 // -------------------- Pins --------------------
 static constexpr int PIN_I2C_SDA   = 8;
 static constexpr int PIN_I2C_SCL   = 9;
@@ -177,6 +188,14 @@ static bool     lastFlying   = false;
 static uint32_t lastAboveStart = 0;
 static uint32_t lastBelowStop  = 0;
 static bool     initialized = false;
+
+// --- WiFi & OTA ---
+static bool     wifiEnabled = false;
+static bool     otaMode = false;
+static WebServer webServer(80);
+static uint32_t otaStartTime = 0;
+static const uint32_t OTA_TIMEOUT_MS = 300000; // 5 minutes
+static bool     uploadSuccess = false;
 
 // --- Baro smoothing/vario (EMA + derivative) ---
 static float altEma = 0.0f;
@@ -505,6 +524,14 @@ static float calculatePolarAirspeed(float vario) {
   float minSink = polar->min_sink_rate;
   float bestGlideSpeed = polar->best_glide_speed;
   
+  // Debug polar values
+  static uint32_t lastPolarDebug = 0;
+  if (millis() - lastPolarDebug > 10000) {
+    Serial.printf("[POLAR] polar=%p, point_count=%d, minSink: %.2f m/s, bestGlide: %.1f kts\n", 
+                  polar, polar ? polar->point_count : 0, minSink, bestGlideSpeed);
+    lastPolarDebug = millis();
+  }
+  
   // For now, use a simple approach: if descending, use best glide speed
   // If climbing, estimate based on climb rate
   if (vario < -0.5f) {
@@ -711,6 +738,7 @@ static void calibrateQNH(){
 #define UUID_CHR_TE_TOGGLE   "f0a0000a-6d75-4d1a-a2a9-d5a9e0a1c001"
 #define UUID_CHR_VOLUME      "f0a0000b-6d75-4d1a-a2a9-d5a9e0a1c001"
 #define UUID_CHR_BRIGHTNESS  "f0a0000c-6d75-4d1a-a2a9-d5a9e0a1c001"
+#define UUID_CHR_OTA         "f0a0000d-6d75-4d1a-a2a9-d5a9e0a1c001"
 
 NimBLEServer*         bleServer     = nullptr;
 NimBLECharacteristic* chPilot       = nullptr;
@@ -724,22 +752,25 @@ NimBLECharacteristic* chPolarSelect = nullptr;
 NimBLECharacteristic* chTEToggle    = nullptr;
 NimBLECharacteristic* chVolume      = nullptr;
 NimBLECharacteristic* chBrightness  = nullptr;
+NimBLECharacteristic* chOTA         = nullptr;
 
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer) {
-    Serial.println("[BLE] Client connected");
+    Serial.println("[BLE] *** CLIENT CONNECTED ***");
   }
 
   void onDisconnect(NimBLEServer* pServer) {
-    Serial.println("[BLE] Client disconnected - restarting advertising");
+    Serial.println("[BLE] *** CLIENT DISCONNECTED *** - restarting advertising");
     // Restart advertising after disconnection
     NimBLEDevice::startAdvertising();
   }
 };
 
 class CfgWriteCB : public NimBLECharacteristicCallbacks {
+public:
   void onWrite(NimBLECharacteristic* c) /*no override keyword for max compatibility*/ {
     std::string v = c->getValue();
+    Serial.printf("[BLE] *** CALLBACK TRIGGERED *** Characteristic: %p, value: '%s', length: %d\n", c, v.c_str(), v.length());
 
     if (c == chPilot) {
       strlcpy(cfg.pilot, v.c_str(), sizeof(cfg.pilot));
@@ -792,6 +823,7 @@ class CfgWriteCB : public NimBLECharacteristicCallbacks {
       }
 
     } else if (c == chVolume) {
+      Serial.printf("[BLE] Volume characteristic written to, value: '%s', size: %d\n", v.c_str(), v.size());
       if (v.size() == 1) {
         cfg.audioVolume = (uint8_t)v[0];
         if (cfg.audioVolume > 10) cfg.audioVolume = 10;
@@ -806,9 +838,26 @@ class CfgWriteCB : public NimBLECharacteristicCallbacks {
         saveConfig();
         Serial.printf("[BLE] Brightness set to: %d\n", cfg.displayBrightness);
       }
+    } else if (c == chOTA) {
+      // OTA command: "START" to begin OTA mode
+      Serial.printf("[BLE] OTA characteristic written: '%s'\n", v.c_str());
+      if (v == "START") {
+        Serial.println("[BLE] Starting WiFi OTA mode...");
+        startWiFiOTA();
+      } else if (v == "STOP") {
+        Serial.println("[BLE] Stopping WiFi OTA mode...");
+        stopWiFiOTA();
+      } else {
+        Serial.printf("[BLE] Unknown OTA command: '%s'\n", v.c_str());
+      }
+    } else {
+      Serial.printf("[BLE] Unknown characteristic written to\n");
     }
   }
 };
+
+// Global callback object to ensure it persists
+static CfgWriteCB g_cfgCallback;
 
 static void updatePolarListCharacteristic() {
   if (!chPolarList) return;
@@ -827,66 +876,137 @@ static void bleUpdateStateChar() {
 }
 
 static void setupBLE() {
-  NimBLEDevice::init("FlightCore");                  // device name
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);           // max practical TX power
-
-  bleServer = NimBLEDevice::createServer();
-  bleServer->setCallbacks(new ServerCallbacks());
-  NimBLEService* svc = bleServer->createService(NimBLEUUID(UUID_SVC_CFG));
-
-  chPilot       = svc->createCharacteristic(UUID_CHR_PILOT,       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  chGType       = svc->createCharacteristic(UUID_CHR_GTYPE,       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  chGID         = svc->createCharacteristic(UUID_CHR_GID,         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  chCID         = svc->createCharacteristic(UUID_CHR_CID,         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  chQNH         = svc->createCharacteristic(UUID_CHR_QNH_PA,      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  chState       = svc->createCharacteristic(UUID_CHR_STATE,       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-  chPolarList   = svc->createCharacteristic(UUID_CHR_POLAR_LIST,  NIMBLE_PROPERTY::READ);
-  chPolarSelect = svc->createCharacteristic(UUID_CHR_POLAR_SELECT,NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  chTEToggle    = svc->createCharacteristic(UUID_CHR_TE_TOGGLE,   NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  chVolume      = svc->createCharacteristic(UUID_CHR_VOLUME,      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  chBrightness  = svc->createCharacteristic(UUID_CHR_BRIGHTNESS,  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-
-  static CfgWriteCB cb;
-  chPilot->setCallbacks(&cb);
-  chGType->setCallbacks(&cb);
-  chGID->setCallbacks(&cb);
-  chCID->setCallbacks(&cb);
-  chQNH->setCallbacks(&cb);
-  chPolarSelect->setCallbacks(&cb);
-  chTEToggle->setCallbacks(&cb);
-  chVolume->setCallbacks(&cb);
-  chBrightness->setCallbacks(&cb);
-
-  // Initial values from persisted cfg
-  chPilot->setValue((uint8_t*)cfg.pilot, strlen(cfg.pilot));
-  chGType->setValue((uint8_t*)cfg.gliderType, strlen(cfg.gliderType));
-  chGID->setValue((uint8_t*)cfg.gliderID, strlen(cfg.gliderID));
-  chCID->setValue((uint8_t*)cfg.compID, strlen(cfg.compID));
-  chQNH->setValue((uint8_t*)&cfg.qnhPa, 4);
-  uint8_t te = cfg.teCompEnabled ? 1 : 0; chTEToggle->setValue(&te,1);
-  chVolume->setValue(&cfg.audioVolume, 1);
-  chBrightness->setValue(&cfg.displayBrightness, 1);
-  updatePolarListCharacteristic();
-
-  svc->start();
-
-  // Configure advertising
-  NimBLEAdvertising* ad = NimBLEDevice::getAdvertising();
+  Serial.println("[BLE] Starting BLE initialization...");
   
+  Serial.println("[BLE] Initializing NimBLE device...");
+  NimBLEDevice::init("FlightCore");                  // device name
+  Serial.println("[BLE] NimBLE device initialized");
+  
+  Serial.println("[BLE] Setting power level...");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);           // max practical TX power
+  Serial.println("[BLE] Power level set");
+  
+  Serial.println("[BLE] Disabling security...");
+  NimBLEDevice::setSecurityAuth(false, false, false); // Disable security for easier connection
+  Serial.println("[BLE] Security disabled");
+
+  Serial.println("[BLE] Creating server...");
+  bleServer = NimBLEDevice::createServer();
+  Serial.printf("[BLE] Server created: %p\n", bleServer);
+  
+  Serial.println("[BLE] Setting server callbacks...");
+  bleServer->setCallbacks(new ServerCallbacks());
+  Serial.println("[BLE] Server callbacks set");
+  
+  Serial.println("[BLE] Creating service...");
+  NimBLEService* svc = bleServer->createService(NimBLEUUID(UUID_SVC_CFG));
+  Serial.printf("[BLE] Service created: %p\n", svc);
+
+  Serial.println("[BLE] Creating characteristics...");
+  chPilot       = svc->createCharacteristic(UUID_CHR_PILOT,       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] Pilot characteristic created");
+  chGType       = svc->createCharacteristic(UUID_CHR_GTYPE,       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] GliderType characteristic created");
+  chGID         = svc->createCharacteristic(UUID_CHR_GID,         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] GliderID characteristic created");
+  chCID         = svc->createCharacteristic(UUID_CHR_CID,         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] CompID characteristic created");
+  chQNH         = svc->createCharacteristic(UUID_CHR_QNH_PA,      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] QNH characteristic created");
+  chState       = svc->createCharacteristic(UUID_CHR_STATE,       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  Serial.println("[BLE] State characteristic created");
+  chPolarList   = svc->createCharacteristic(UUID_CHR_POLAR_LIST,  NIMBLE_PROPERTY::READ);
+  Serial.println("[BLE] PolarList characteristic created");
+  chPolarSelect = svc->createCharacteristic(UUID_CHR_POLAR_SELECT,NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] PolarSelect characteristic created");
+  chTEToggle    = svc->createCharacteristic(UUID_CHR_TE_TOGGLE,   NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] TEToggle characteristic created");
+  chVolume      = svc->createCharacteristic(UUID_CHR_VOLUME,      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] Volume characteristic created");
+  chBrightness  = svc->createCharacteristic(UUID_CHR_BRIGHTNESS,  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  Serial.println("[BLE] Brightness characteristic created");
+  chOTA         = svc->createCharacteristic(UUID_CHR_OTA,         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
+  Serial.printf("[BLE] OTA characteristic created: %p\n", chOTA);
+
+  Serial.println("[BLE] Setting up callbacks...");
+  Serial.printf("[BLE] Using global callback object: %p\n", &g_cfgCallback);
+  
+  chPilot->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] Pilot callback set");
+  chGType->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] GliderType callback set");
+  chGID->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] GliderID callback set");
+  chCID->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] CompID callback set");
+  chQNH->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] QNH callback set");
+  chPolarSelect->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] PolarSelect callback set");
+  chTEToggle->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] TEToggle callback set");
+  chVolume->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] Volume callback set");
+  chBrightness->setCallbacks(&g_cfgCallback);
+  Serial.println("[BLE] Brightness callback set");
+  chOTA->setCallbacks(&g_cfgCallback);
+  Serial.printf("[BLE] OTA callback set: %p\n", &g_cfgCallback);
+
+  Serial.println("[BLE] Setting initial values...");
+  chPilot->setValue((uint8_t*)cfg.pilot, strlen(cfg.pilot));
+  Serial.println("[BLE] Pilot value set");
+  chGType->setValue((uint8_t*)cfg.gliderType, strlen(cfg.gliderType));
+  Serial.println("[BLE] GliderType value set");
+  chGID->setValue((uint8_t*)cfg.gliderID, strlen(cfg.gliderID));
+  Serial.println("[BLE] GliderID value set");
+  chCID->setValue((uint8_t*)cfg.compID, strlen(cfg.compID));
+  Serial.println("[BLE] CompID value set");
+  chQNH->setValue((uint8_t*)&cfg.qnhPa, 4);
+  Serial.println("[BLE] QNH value set");
+  uint8_t te = cfg.teCompEnabled ? 1 : 0; chTEToggle->setValue(&te,1);
+  Serial.println("[BLE] TEToggle value set");
+  chVolume->setValue(&cfg.audioVolume, 1);
+  Serial.println("[BLE] Volume value set");
+  chBrightness->setValue(&cfg.displayBrightness, 1);
+  Serial.println("[BLE] Brightness value set");
+  chOTA->setValue("READY");
+  Serial.println("[BLE] OTA value set to READY");
+  updatePolarListCharacteristic();
+  Serial.println("[BLE] Polar list updated");
+
+  Serial.println("[BLE] Starting service...");
+  svc->start();
+  Serial.println("[BLE] Service started");
+
+  Serial.println("[BLE] Configuring advertising...");
+  NimBLEAdvertising* ad = NimBLEDevice::getAdvertising();
+  Serial.printf("[BLE] Advertising object: %p\n", ad);
+  
+  Serial.println("[BLE] Creating advertisement data...");
   // Create advertisement data with device name
   NimBLEAdvertisementData advertisementData;
   advertisementData.setName("FlightCore");
+  Serial.println("[BLE] Advertisement name set");
   advertisementData.setCompleteServices(NimBLEUUID(UUID_SVC_CFG));
+  Serial.println("[BLE] Advertisement services set");
   
+  Serial.println("[BLE] Creating scan response data...");
   // Create scan response data
   NimBLEAdvertisementData scanResponseData;
   scanResponseData.setName("FlightCore");
+  Serial.println("[BLE] Scan response name set");
   
+  Serial.println("[BLE] Setting advertisement data...");
   ad->setAdvertisementData(advertisementData);
+  Serial.println("[BLE] Advertisement data set");
   ad->setScanResponseData(scanResponseData);
+  Serial.println("[BLE] Scan response data set");
   ad->setMinInterval(0x20);  // 20ms (0x20 * 0.625ms)
+  Serial.println("[BLE] Min interval set");
   ad->setMaxInterval(0x40);  // 40ms (0x40 * 0.625ms)
+  Serial.println("[BLE] Max interval set");
   
+  Serial.println("[BLE] Starting advertising...");
   if (ad->start()) {
     Serial.println("[BLE] Advertising 'FlightCore' with config service - STARTED");
   } else {
@@ -900,6 +1020,134 @@ static void restartBLEAdvertising() {
   delay(100);
   NimBLEDevice::startAdvertising();
   Serial.println("[BLE] Advertising restarted");
+}
+
+// -------------------- WiFi & OTA Functions --------------------
+
+static void startWiFiOTA() {
+  if (wifiEnabled) return; // Already running
+  
+  Serial.println("[OTA] Starting WiFi OTA mode...");
+  
+  // Create access point for OTA
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("FlightCore-OTA", "flightcore123");
+  
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.printf("[OTA] Access Point started: %s\n", apIP.toString().c_str());
+  Serial.println("[OTA] Connect to WiFi: FlightCore-OTA");
+  Serial.println("[OTA] Password: flightcore123");
+  Serial.printf("[OTA] Open browser: http://%s\n", apIP.toString().c_str());
+  
+  // Setup web server
+  webServer.on("/", []() {
+    webServer.send(200, "text/html", 
+      "<html><head><style>"
+      "body { font-family: Arial, sans-serif; font-size: 24px; margin: 40px; }"
+      "h1 { font-size: 36px; color: #2c3e50; margin-bottom: 30px; }"
+      "form { margin: 30px 0; }"
+      "input[type='file'] { font-size: 20px; margin: 10px 0; padding: 10px; }"
+      "input[type='submit'] { font-size: 20px; padding: 15px 30px; background-color: #3498db; color: white; border: none; border-radius: 5px; cursor: pointer; }"
+      "input[type='submit']:hover { background-color: #2980b9; }"
+      "p { font-size: 20px; color: #7f8c8d; margin-top: 20px; }"
+      "</style></head><body>"
+      "<h1>FlightCore OTA Update</h1>"
+      "<form method='POST' action='/update' enctype='multipart/form-data'>"
+      "<input type='file' name='firmware' accept='.bin'>"
+      "<br><br>"
+      "<input type='submit' value='Upload Firmware'>"
+      "</form>"
+      "<p>Select firmware.bin file and click Upload</p>"
+      "</body></html>"
+    );
+  });
+  
+  webServer.on("/update", HTTP_POST, []() {
+    webServer.sendHeader("Connection", "close");
+    if (uploadSuccess) {
+      webServer.send(200, "text/plain", "OK");
+      Serial.println("[OTA] Upload successful, restarting...");
+      ESP.restart();
+    } else {
+      webServer.send(400, "text/plain", "Upload failed or no file selected");
+      Serial.println("[OTA] Upload failed, staying in OTA mode");
+    }
+  }, []() {
+    HTTPUpload& upload = webServer.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("[OTA] Update: %s\n", upload.filename.c_str());
+      uploadSuccess = false; // Reset success flag
+      
+      // Check if filename is empty (no file selected)
+      if (upload.filename.length() == 0) {
+        Serial.println("[OTA] ERROR: No file selected!");
+        return;
+      }
+      
+      // Check if it's a .bin file
+      if (!upload.filename.endsWith(".bin")) {
+        Serial.printf("[OTA] ERROR: Invalid file type: %s\n", upload.filename.c_str());
+        return;
+      }
+      
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.printError(Serial);
+        return;
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+        uploadSuccess = false;
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) {
+        Serial.printf("[OTA] Update Success: %u bytes\n", upload.totalSize);
+        uploadSuccess = true;
+      } else {
+        Update.printError(Serial);
+        uploadSuccess = false;
+      }
+    }
+  });
+  
+  webServer.begin();
+  
+  wifiEnabled = true;
+  otaMode = true;
+  otaStartTime = millis();
+  
+  // Notify via BLE
+  if (chState) {
+    chState->setValue("OTA_MODE");
+    chState->notify();
+  }
+}
+
+static void stopWiFiOTA() {
+  if (!wifiEnabled) return;
+  
+  Serial.println("[OTA] Stopping WiFi OTA mode...");
+  
+  webServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  
+  wifiEnabled = false;
+  otaMode = false;
+  
+  Serial.println("[OTA] WiFi disabled, returning to normal operation");
+}
+
+static void handleOTA() {
+  if (otaMode && wifiEnabled) {
+    webServer.handleClient();
+    
+    // Auto-shutdown after timeout
+    if (millis() - otaStartTime > OTA_TIMEOUT_MS) {
+      Serial.println("[OTA] Timeout reached, shutting down WiFi");
+      stopWiFiOTA();
+    }
+  }
 }
 
 // -------------------- Arduino --------------------
@@ -969,6 +1217,9 @@ void setup(){
 
   // === BLE ===
   setupBLE();
+  
+  // BLE system ready
+  Serial.println("[BLE] BLE system initialized and ready");
 
   // Write boot log to SD card
   writeBootLog();
@@ -977,6 +1228,7 @@ void setup(){
 }
 
 void loop(){
+  handleOTA();          // Handle WiFi OTA updates if active
   csv.poll();           // handle inbound SET/PING/PONG
   updateBaroKalman();
   pollGPS();
@@ -985,11 +1237,33 @@ void loop(){
   if (gps.speed.isValid()) {
     updateTurnRate(); // Update turn rate for airspeed calculation
     float gpsSpeed = gps.speed.knots();
-    float calculatedAirspeed = calculateAirspeed(gpsSpeed, vario_mps);
-    calculateWind();
     
-    // Use calculated airspeed for flight detection instead of GPS groundspeed
-    asi_kts = calculatedAirspeed;
+    // Only calculate airspeed if we're actually moving (GPS speed > 5 kts)
+    if (gpsSpeed > 5.0f) {
+      float calculatedAirspeed = calculateAirspeed(gpsSpeed, vario_mps);
+      calculateWind();
+      
+      // Debug output for airspeed calculation
+      static uint32_t lastDebugMs = 0;
+      if (millis() - lastDebugMs > 5000) {
+        Serial.printf("[DEBUG] Vario: %.2f m/s, GPS: %.1f kts, AS: %.1f kts\n", 
+                      vario_mps, gpsSpeed, calculatedAirspeed);
+        lastDebugMs = millis();
+      }
+      
+      // Use calculated airspeed for display
+      asi_kts = calculatedAirspeed;
+    } else {
+      // Not moving - use GPS speed as airspeed
+      asi_kts = gpsSpeed;
+      
+      // Debug output for stationary state
+      static uint32_t lastDebugMs = 0;
+      if (millis() - lastDebugMs > 5000) {
+        Serial.printf("[DEBUG] Stationary: GPS: %.1f kts, AS: %.1f kts\n", gpsSpeed, asi_kts);
+        lastDebugMs = millis();
+      }
+    }
   } else {
     // No GPS speed - set airspeed to 0
     asi_kts = 0.0f;
@@ -1079,5 +1353,28 @@ void loop(){
       restartBLEAdvertising();
     }
     lastBLECheck = now;
+  }
+
+  // Check OTA characteristic value periodically (every 2 seconds)
+  static uint32_t lastOTACheck = 0;
+  if (now - lastOTACheck >= 2000) {
+    if (chOTA) {
+      std::string otaValue = chOTA->getValue();
+      static std::string lastOTAValue = "";
+      if (otaValue != lastOTAValue) {
+        Serial.printf("[BLE] OTA value changed: '%s' -> '%s'\n", lastOTAValue.c_str(), otaValue.c_str());
+        lastOTAValue = otaValue;
+        
+        // Handle OTA commands
+        if (otaValue == "START") {
+          Serial.println("[BLE] OTA START command detected");
+          startWiFiOTA();
+        } else if (otaValue == "STOP") {
+          Serial.println("[BLE] OTA STOP command detected");
+          stopWiFiOTA();
+        }
+      }
+    }
+    lastOTACheck = now;
   }
 }
