@@ -176,6 +176,7 @@ static bool     flying       = false;
 static bool     lastFlying   = false;
 static uint32_t lastAboveStart = 0;
 static uint32_t lastBelowStop  = 0;
+static bool     initialized = false;
 
 // --- Baro smoothing/vario (EMA + derivative) ---
 static float altEma = 0.0f;
@@ -263,7 +264,7 @@ static void pollGPS(){
   sats = (uint8_t)gps.satellites.value();
   bool locOK=gps.location.isValid(), altOK=gps.altitude.isValid(), spdOK=gps.speed.isValid();
   fix = locOK ? (altOK ? 2 : 1) : 0;
-  if (spdOK) asi_kts = gps.speed.knots();
+  // Note: asi_kts is now set by calculateAirspeed() in main loop
   
   // Update turn rate for airspeed calculation
   // (moved to after function declarations)
@@ -465,6 +466,7 @@ static void writeBootLog() {
   bootLog.printf("GPS: UART2 @9600 on pins 4/5\n");
   bootLog.printf("CSV Link: UART1 @115200 on pins 44/43\n");
   bootLog.printf("BLE: Advertising 'FlightCore'\n");
+  bootLog.printf("BLE Status: %s\n", NimBLEDevice::getAdvertising()->isAdvertising() ? "Advertising" : "Not Advertising");
   bootLog.printf("Sea Level Pressure: %.1f Pa\n", seaLevelPa);
   bootLog.printf("Initial Altitude: %.1f m\n", alt_m);
   bootLog.println("=== End Boot Log ===");
@@ -495,22 +497,24 @@ static FlightMode detectFlightMode(float vario, float airspeed, float turnRate) 
 
 static float calculatePolarAirspeed(float vario) {
   // Use inverse polar calculation to estimate airspeed from sink rate
-  // This is a simplified approach - in reality, you'd need to solve the polar equation
   const GliderPolar* polar = teComp.getCurrentPolar();
   if (!polar || polar->point_count < 2) {
     return 40.0f; // Default airspeed if no polar
   }
   
-  // Find the airspeed that would give this sink rate
-  // This is an approximation - real calculation would be more complex
   float minSink = polar->min_sink_rate;
   float bestGlideSpeed = polar->best_glide_speed;
   
-  if (vario > minSink) {
-    // Above min sink - estimate airspeed based on polar curve
-    return bestGlideSpeed + (vario - minSink) * 10.0f; // Rough approximation
+  // For now, use a simple approach: if descending, use best glide speed
+  // If climbing, estimate based on climb rate
+  if (vario < -0.5f) {
+    // Strong descent - use best glide speed
+    return bestGlideSpeed;
+  } else if (vario > 0.5f) {
+    // Climbing - estimate airspeed (climbing usually at slower speeds)
+    return bestGlideSpeed * 0.8f + (vario - 0.5f) * 5.0f;
   } else {
-    // Below min sink - use best glide speed
+    // Near level flight - use best glide speed
     return bestGlideSpeed;
   }
 }
@@ -721,6 +725,18 @@ NimBLECharacteristic* chTEToggle    = nullptr;
 NimBLECharacteristic* chVolume      = nullptr;
 NimBLECharacteristic* chBrightness  = nullptr;
 
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer) {
+    Serial.println("[BLE] Client connected");
+  }
+
+  void onDisconnect(NimBLEServer* pServer) {
+    Serial.println("[BLE] Client disconnected - restarting advertising");
+    // Restart advertising after disconnection
+    NimBLEDevice::startAdvertising();
+  }
+};
+
 class CfgWriteCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c) /*no override keyword for max compatibility*/ {
     std::string v = c->getValue();
@@ -815,6 +831,7 @@ static void setupBLE() {
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);           // max practical TX power
 
   bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new ServerCallbacks());
   NimBLEService* svc = bleServer->createService(NimBLEUUID(UUID_SVC_CFG));
 
   chPilot       = svc->createCharacteristic(UUID_CHR_PILOT,       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
@@ -853,13 +870,36 @@ static void setupBLE() {
 
   svc->start();
 
+  // Configure advertising
   NimBLEAdvertising* ad = NimBLEDevice::getAdvertising();
-  ad->addServiceUUID(svc->getUUID());  // advertise service UUID
-  ad->setScanResponseData(NimBLEAdvertisementData()); // enable scan response for device name
-  ad->setMinInterval(0x06);            // functions that help with iPhone connections issue
-  ad->setMaxInterval(0x12);
-  ad->start();
-  Serial.println("[BLE] Advertising 'FlightCore' with config service");
+  
+  // Create advertisement data with device name
+  NimBLEAdvertisementData advertisementData;
+  advertisementData.setName("FlightCore");
+  advertisementData.setCompleteServices(NimBLEUUID(UUID_SVC_CFG));
+  
+  // Create scan response data
+  NimBLEAdvertisementData scanResponseData;
+  scanResponseData.setName("FlightCore");
+  
+  ad->setAdvertisementData(advertisementData);
+  ad->setScanResponseData(scanResponseData);
+  ad->setMinInterval(0x20);  // 20ms (0x20 * 0.625ms)
+  ad->setMaxInterval(0x40);  // 40ms (0x40 * 0.625ms)
+  
+  if (ad->start()) {
+    Serial.println("[BLE] Advertising 'FlightCore' with config service - STARTED");
+  } else {
+    Serial.println("[BLE] ERROR: Failed to start advertising");
+  }
+}
+
+static void restartBLEAdvertising() {
+  Serial.println("[BLE] Restarting advertising...");
+  NimBLEDevice::stopAdvertising();
+  delay(100);
+  NimBLEDevice::startAdvertising();
+  Serial.println("[BLE] Advertising restarted");
 }
 
 // -------------------- Arduino --------------------
@@ -950,6 +990,9 @@ void loop(){
     
     // Use calculated airspeed for flight detection instead of GPS groundspeed
     asi_kts = calculatedAirspeed;
+  } else {
+    // No GPS speed - set airspeed to 0
+    asi_kts = 0.0f;
   }
   
   logIgcRecord();       // log GPS track data to IGC file
@@ -957,10 +1000,36 @@ void loop(){
   uint32_t now = millis();
 
   // Debounced flight detection
-  if (asi_kts >= SPEED_KTS_START) lastAboveStart = now;
-  if (asi_kts <= SPEED_KTS_STOP)  lastBelowStop  = now;
-  if (!flying && (now - lastAboveStart) >= START_DEBOUNCE_MS) flying = true;
-  if ( flying && (now - lastBelowStop)  >= STOP_DEBOUNCE_MS)  flying = false;
+  if (!initialized) {
+    lastAboveStart = 0;  // Set to 0, not current time
+    lastBelowStop = now;
+    initialized = true;
+  }
+  
+  // Use GPS groundspeed for flight detection, not calculated airspeed
+  float flightDetectionSpeed = gps.speed.isValid() ? gps.speed.knots() : 0.0f;
+  
+  if (flightDetectionSpeed >= SPEED_KTS_START) {
+    lastAboveStart = now;
+    static uint32_t lastSpeedLog = 0;
+    if (now - lastSpeedLog > 5000) {
+      Serial.printf("[FLIGHT] Speed above threshold: %.1f kts (GPS: %.1f kts, AS: %.1f kts)\n", 
+                    flightDetectionSpeed, gps.speed.knots(), asi_kts);
+      lastSpeedLog = now;
+    }
+  }
+  if (flightDetectionSpeed <= SPEED_KTS_STOP)  lastBelowStop  = now;
+  
+  if (!flying && lastAboveStart > 0 && (now - lastAboveStart) >= START_DEBOUNCE_MS) {
+    flying = true;
+    Serial.printf("[FLIGHT] FLIGHT DETECTED! GPS: %.1f kts, AS: %.1f kts\n", 
+                  flightDetectionSpeed, asi_kts);
+  }
+  if ( flying && (now - lastBelowStop)  >= STOP_DEBOUNCE_MS) {
+    flying = false;
+    Serial.printf("[FLIGHT] Flight ended. GPS: %.1f kts, AS: %.1f kts\n", 
+                  flightDetectionSpeed, asi_kts);
+  }
 
   if (flying != lastFlying) {
     lastFlying = flying;
@@ -1000,5 +1069,15 @@ void loop(){
                   gps.speed.isValid() ? gps.speed.knots() : 0.0f,
                   modeNames[airspeedData.mode], airspeedData.confidence, (unsigned)fix, (unsigned)sats);
     lastPrint = now;
+  }
+
+  // Periodic BLE advertising check (every 30 seconds)
+  static uint32_t lastBLECheck = 0;
+  if (now - lastBLECheck >= 30000) {
+    if (!NimBLEDevice::getAdvertising()->isAdvertising()) {
+      Serial.println("[BLE] Advertising stopped - restarting");
+      restartBLEAdvertising();
+    }
+    lastBLECheck = now;
   }
 }
