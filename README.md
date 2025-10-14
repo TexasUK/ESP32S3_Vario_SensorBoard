@@ -29,6 +29,13 @@ FlightCore is an advanced variometer system designed for gliding applications. I
 - **Real-time telemetry** via CSV protocol to display units
 - **Multiple glider polar curves** with automatic selection
 
+### 🔄 **Over-The-Air (OTA) Updates**
+- **BLE-triggered WiFi OTA** for wireless firmware updates
+- **Web-based upload interface** with improved mobile-friendly design
+- **Automatic WiFi access point** creation for update mode
+- **Robust upload validation** prevents system crashes
+- **5-minute timeout** for security and power management
+
 ## System Behavior
 
 ### **Startup Sequence**
@@ -107,14 +114,22 @@ FlightCore is an advanced variometer system designed for gliding applications. I
 - **Polar curve selection** and thermal compensation settings
 - **Audio and display preferences**
 
+### **OTA Update System**
+- **BLE command interface** - Write "START" to OTA characteristic to begin update mode
+- **WiFi access point** - "FlightCore-OTA" network (password: flightcore123)
+- **Web interface** - http://192.168.4.1 for firmware upload
+- **Automatic shutdown** - Write "STOP" to OTA characteristic or wait 5 minutes
+- **Upload validation** - Only accepts .bin files, prevents crashes from invalid uploads
+
 ## System Requirements
 
 ### **Hardware**
-- ESP32-S3 Mini microcontroller
+- ESP32-S3 Mini microcontroller (4MB flash, 2MB PSRAM)
 - BMP581 barometric pressure sensor
 - GPS module (UART2)
 - SD card for flight logging
-- BLE for configuration
+- BLE for configuration and OTA triggering
+- WiFi for OTA updates
 
 ### **Power**
 - 3.3V operation
@@ -133,6 +148,26 @@ FlightCore is an advanced variometer system designed for gliding applications. I
 3. **Configure via BLE** using mobile app
 4. **Set glider polar** and pilot information
 5. **Ready for flight** - automatic detection and logging
+
+## OTA Firmware Updates
+
+### **Starting OTA Mode**
+1. **Connect to BLE** using nRF Connect or Serial Bluetooth
+2. **Find the OTA characteristic** (UUID: f0a0000d-6d75-4d1a-a2a9-d5a9e0a1c001)
+3. **Write "START"** to the characteristic
+4. **Look for WiFi network** "FlightCore-OTA" (password: flightcore123)
+5. **Connect to WiFi** and open http://192.168.4.1
+6. **Upload firmware.bin** file using the web interface
+
+### **Stopping OTA Mode**
+- **Write "STOP"** to the OTA characteristic, or
+- **Wait 5 minutes** for automatic timeout, or
+- **Power cycle** the device
+
+### **Troubleshooting OTA**
+- **No WiFi network**: Check BLE connection and try writing "START" again
+- **Upload fails**: Ensure you're uploading a valid .bin file
+- **System crashes**: The new validation prevents crashes from invalid uploads
 
 ## Support
 
