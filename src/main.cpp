@@ -7,6 +7,10 @@
 // BMP581 on I2C SDA=8 SCL=9
 // SD card on SPI pins 6,7,10,11 for IGC flight logging
 // IGC files created automatically when flight detected (speed > 20 kts)
+//
+// POLAR FILES: Place .plr files in /data folder on SD card
+// Format: *ASK13 WinPilot POLAR file (w. LK8000 extension) : MassDryGross[kg], MaxWaterBallast[liters], Speed1[km/h], Sink1[m/s], Speed2, Sink2, Speed3, Sink3, WingArea[m2]
+// Example: 380,  0,  78.05,  -0.79, 124.03,  -1.97, 170.00,  -4.54,  17.50
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -80,13 +84,12 @@ struct GliderPolar {
   float min_sink_rate;
   float best_glide_speed;
 };
-const GliderPolar defaultPolars[] = {
-  {"LS8","LS8-b",{{30,-0.50},{35,-0.60},{40,-0.72},{45,-0.95},{50,-1.25},{55,-1.65},{60,-2.15}},7,-0.60,42},
-  {"DG-800","DG-800",{{35,-0.55},{40,-0.68},{45,-0.92},{50,-1.25},{55,-1.68},{60,-2.22},{65,-2.85}},7,-0.55,44},
-  {"ASG-29","ASG-29 18m",{{40,-0.48},{45,-0.62},{50,-0.85},{55,-1.15},{60,-1.55},{65,-2.05},{70,-2.65}},7,-0.48,47},
-  {"Discus","Discus-b",{{30,-0.60},{35,-0.65},{40,-0.75},{45,-0.95},{50,-1.25},{55,-1.65}},6,-0.60,40},
+// ASK13 default polar (used if no SD card polars found)
+const GliderPolar ask13DefaultPolar = {
+  "ASK13", "ASK13", 
+  {{30,-0.60},{35,-0.70},{40,-0.80},{45,-1.00},{50,-1.30},{55,-1.70},{60,-2.20}}, 
+  7, -0.60, 40
 };
-const int defaultPolarCount = 4;
 
 class TECompensator {
   const GliderPolar* currentPolar = nullptr;
@@ -148,7 +151,10 @@ static void loadConfig() {
   prefs.end();
 }
 
-GliderPolar polars[20]; int polarCount=0;
+GliderPolar* polars = nullptr; // Dynamic array to hold SD card polars
+int polarCount = 0;
+int polarCapacity = 0;
+char** polarFilenames = nullptr; // Dynamic array to store filenames
 
 // -------------------- Telemetry / state --------------------
 static float alt_m=0.0f, vario_mps=0.0f, asi_kts=0.0f;
@@ -196,6 +202,28 @@ static WebServer webServer(80);
 static uint32_t otaStartTime = 0;
 static const uint32_t OTA_TIMEOUT_MS = 300000; // 5 minutes
 static bool     uploadSuccess = false;
+
+// --- Startup sequence ---
+enum StartupState {
+  STARTUP_SENSOR_CONNECTION,    // Phase 1: Wait for sensor connection
+  STARTUP_DATA_LOADING,         // Phase 1: Load polar data with progress
+  STARTUP_DATA_VALIDATION,      // Phase 1: Validate loaded data
+  STARTUP_QNH_ENTRY,           // Phase 2: User enters QNH
+  STARTUP_POLAR_SELECTION,     // Phase 2: User selects polar
+  STARTUP_COMPLETE             // Normal operation
+};
+static StartupState startupState = STARTUP_SENSOR_CONNECTION;
+static bool startupComplete = false;
+static String qnhEntry = "";
+static int selectedPolarIndex = 0;
+
+// Phase 1 data loading tracking
+static bool sensorConnected = false;
+static bool polarDataRequested = false;
+static bool polarDataComplete = false;
+static int polarDataReceived = 0;
+static uint32_t lastSensorCheck = 0;
+static uint32_t dataLoadingStartTime = 0;
 
 // --- Baro smoothing/vario (EMA + derivative) ---
 static float altEma = 0.0f;
@@ -475,8 +503,8 @@ static void writeBootLog() {
   bootLog.printf("Glider: %s (%s)\n", cfg.gliderType, cfg.gliderID);
   bootLog.printf("Competition ID: %s\n", cfg.compID);
   bootLog.printf("QNH: %u Pa\n", cfg.qnhPa);
-  bootLog.printf("Selected Polar: %s\n", cfg.selectedPolarIndex < defaultPolarCount ? 
-                 defaultPolars[cfg.selectedPolarIndex].name : "Unknown");
+  bootLog.printf("Selected Polar: %s\n", cfg.selectedPolarIndex < polarCount ? 
+                 polars[cfg.selectedPolarIndex].name : "Unknown");
   bootLog.printf("TE Compensation: %s\n", cfg.teCompEnabled ? "Enabled" : "Disabled");
   bootLog.printf("Audio Volume: %d/10\n", cfg.audioVolume);
   bootLog.printf("Display Brightness: %d/10\n", cfg.displayBrightness);
@@ -807,11 +835,13 @@ public:
     } else if (c == chPolarSelect) {
       if (v.size() == 1) {
         uint8_t idx = (uint8_t)v[0];
-        if (idx < defaultPolarCount) {
+        if (idx < polarCount) {
           cfg.selectedPolarIndex = idx;
-          teComp.setPolar(&defaultPolars[idx]);
+          teComp.setPolar(&polars[idx]);
           saveConfig();
-          Serial.printf("[BLE] Selected polar: %s\n", defaultPolars[idx].name);
+          Serial.printf("[BLE] Selected polar: %s (index %d)\n", polars[idx].name, idx);
+        } else {
+          Serial.printf("[BLE] Invalid polar index: %d (max: %d)\n", idx, polarCount - 1);
         }
       }
 
@@ -859,13 +889,503 @@ public:
 // Global callback object to ensure it persists
 static CfgWriteCB g_cfgCallback;
 
+static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
+  if (!sdMounted) return false;
+  
+  FsFile file;
+  if (!file.open(filename, O_RDONLY)) {
+    Serial.printf("[POLAR] Failed to open file: %s\n", filename);
+    return false;
+  }
+  
+  // Read the file line by line
+  String line;
+  bool foundData = false;
+  int pointCount = 0;
+  
+  while (file.available() && pointCount < 12) {
+    line = file.readStringUntil('\n');
+    line.trim();
+    
+    // Skip empty lines and comments
+    if (line.length() == 0 || line.startsWith("*") || line.startsWith("#")) {
+      continue;
+    }
+    
+    // Look for the data line (contains numbers)
+    if (line.indexOf(',') > 0) {
+      // Parse the polar data line
+      // Format: MassDryGross[kg], MaxWaterBallast[liters], Speed1[km/h], Sink1[m/s], Speed2, Sink2, Speed3, Sink3, WingArea[m2]
+      int commaCount = 0;
+      int lastComma = 0;
+      float speeds[12], sinks[12];
+      
+      for (int i = 0; i < line.length(); i++) {
+        if (line.charAt(i) == ',') {
+          commaCount++;
+          if (commaCount >= 3) { // Start from Speed1
+            String value = line.substring(lastComma + 1, i);
+            value.trim();
+            float val = value.toFloat();
+            
+            if ((commaCount - 3) % 2 == 0) { // Even = speed
+              speeds[(commaCount - 3) / 2] = val / 3.6f; // Convert km/h to m/s, then to kts
+            } else { // Odd = sink
+              sinks[(commaCount - 3) / 2] = val; // Already in m/s
+            }
+            
+            if (commaCount >= 3 + (pointCount + 1) * 2) {
+              pointCount++;
+            }
+          }
+          lastComma = i;
+        }
+      }
+      
+      // Convert speeds from m/s to knots and populate polar
+      for (int i = 0; i < pointCount && i < 12; i++) {
+        polar->points[i].asi_kts = speeds[i] * 1.94384f; // m/s to knots
+        polar->points[i].sink_rate_ms = sinks[i];
+      }
+      
+      polar->point_count = pointCount;
+      
+      // Calculate min sink and best glide
+      if (pointCount > 0) {
+        polar->min_sink_rate = sinks[0];
+        polar->best_glide_speed = speeds[0] * 1.94384f;
+        
+        for (int i = 1; i < pointCount; i++) {
+          if (sinks[i] > polar->min_sink_rate) {
+            polar->min_sink_rate = sinks[i];
+          }
+          // Find best glide (lowest sink rate)
+          if (sinks[i] < polar->min_sink_rate) {
+            polar->min_sink_rate = sinks[i];
+            polar->best_glide_speed = speeds[i] * 1.94384f;
+          }
+        }
+      }
+      
+      foundData = true;
+      break;
+    }
+  }
+  
+  file.close();
+  
+  if (foundData && pointCount > 0) {
+    // Extract glider name from filename
+    String fname = String(filename);
+    int lastSlash = fname.lastIndexOf('/');
+    int lastDot = fname.lastIndexOf('.');
+    if (lastSlash >= 0 && lastDot > lastSlash) {
+      fname = fname.substring(lastSlash + 1, lastDot);
+    }
+    strlcpy(polar->name, fname.c_str(), sizeof(polar->name));
+    strlcpy(polar->model, fname.c_str(), sizeof(polar->model));
+    
+    Serial.printf("[POLAR] Loaded %s: %d points, min sink: %.2f m/s, best glide: %.1f kts\n", 
+                  polar->name, polar->point_count, polar->min_sink_rate, polar->best_glide_speed);
+    return true;
+  }
+  
+  Serial.printf("[POLAR] No valid data found in: %s\n", filename);
+  return false;
+}
+
+// Dynamic array management functions
+static void expandPolarArrays() {
+  int newCapacity = polarCapacity == 0 ? 10 : polarCapacity * 2;
+  Serial.printf("[POLAR] Expanding arrays from %d to %d capacity\n", polarCapacity, newCapacity);
+  
+  GliderPolar* newPolars = (GliderPolar*)realloc(polars, newCapacity * sizeof(GliderPolar));
+  char** newFilenames = (char**)realloc(polarFilenames, newCapacity * sizeof(char*));
+  
+  if (newPolars && newFilenames) {
+    polars = newPolars;
+    polarFilenames = newFilenames;
+    polarCapacity = newCapacity;
+    
+    // Initialize new filename slots
+    for (int i = polarCount; i < polarCapacity; i++) {
+      polarFilenames[i] = (char*)malloc(64);
+      polarFilenames[i][0] = '\0';
+    }
+    Serial.printf("[POLAR] Arrays expanded successfully to capacity %d\n", polarCapacity);
+  } else {
+    Serial.println("[POLAR] Failed to expand arrays - memory allocation error");
+  }
+}
+
+static void addPolar(const GliderPolar& polar, const char* filename) {
+  Serial.printf("[POLAR] Adding polar: %s (current count: %d, capacity: %d)\n", polar.name, polarCount, polarCapacity);
+  
+  if (polarCount >= polarCapacity) {
+    Serial.println("[POLAR] Expanding arrays...");
+    expandPolarArrays();
+  }
+  
+  if (polarCount < polarCapacity) {
+    polars[polarCount] = polar;
+    strlcpy(polarFilenames[polarCount], filename, 64);
+    polarCount++;
+    Serial.printf("[POLAR] Successfully added polar: %s (new count: %d)\n", polar.name, polarCount);
+  } else {
+    Serial.printf("[POLAR] Failed to add polar: %s (capacity exceeded)\n", polar.name);
+  }
+}
+
+static void cleanupPolarArrays() {
+  if (polarFilenames) {
+    for (int i = 0; i < polarCapacity; i++) {
+      free(polarFilenames[i]);
+    }
+    free(polarFilenames);
+    polarFilenames = nullptr;
+  }
+  if (polars) {
+    free(polars);
+    polars = nullptr;
+  }
+  polarCount = 0;
+  polarCapacity = 0;
+}
+
+static void scanPolarFiles() {
+  Serial.println("[POLAR] Starting polar file scan...");
+  
+  // Clean up any existing arrays
+  cleanupPolarArrays();
+  
+  if (!sdMounted) {
+    Serial.println("[POLAR] SD card not mounted, using ASK13 default");
+    addPolar(ask13DefaultPolar, "DEFAULT");
+    Serial.printf("[POLAR] Added ASK13 default, total polars: %d\n", polarCount);
+    return;
+  }
+  
+  Serial.println("[POLAR] SD card mounted, checking for /data directory...");
+  
+  // Check if /data directory exists
+  if (!sd.exists("/data")) {
+    Serial.println("[POLAR] /data directory not found, using ASK13 default");
+    addPolar(ask13DefaultPolar, "DEFAULT");
+    Serial.printf("[POLAR] Added ASK13 default, total polars: %d\n", polarCount);
+    return;
+  }
+  
+  Serial.println("[POLAR] /data directory found, scanning for .plr files...");
+  
+  // Scan for .plr files in /data directory
+  FsFile dir = sd.open("/data");
+  if (!dir.isDirectory()) {
+    Serial.println("[POLAR] /data is not a directory, using ASK13 default");
+    addPolar(ask13DefaultPolar, "DEFAULT");
+    Serial.printf("[POLAR] Added ASK13 default, total polars: %d\n", polarCount);
+    return;
+  }
+  
+  int filesFound = 0;
+  FsFile file;
+  while (file = dir.openNextFile()) {
+    if (!file.isDirectory()) {
+      char filename[64];
+      file.getName(filename, sizeof(filename));
+      String filenameStr = String(filename);
+      Serial.printf("[POLAR] Found file: %s\n", filename);
+      
+      if (filenameStr.endsWith(".plr")) {
+        String fullPath = "/data/" + filenameStr;
+        Serial.printf("[POLAR] Processing .plr file: %s\n", fullPath.c_str());
+        
+        // Load the polar file
+        GliderPolar newPolar;
+        if (loadPolarFromFile(fullPath.c_str(), &newPolar)) {
+          addPolar(newPolar, fullPath.c_str());
+          Serial.printf("[POLAR] Successfully loaded polar: %s\n", newPolar.name);
+          filesFound++;
+        } else {
+          Serial.printf("[POLAR] Failed to load polar from: %s\n", fullPath.c_str());
+        }
+      }
+    }
+    file.close();
+  }
+  dir.close();
+  
+  Serial.printf("[POLAR] Found %d .plr files\n", filesFound);
+  
+  // If no polars were loaded, use ASK13 default
+  if (polarCount == 0) {
+    Serial.println("[POLAR] No polar files found, using ASK13 default");
+    addPolar(ask13DefaultPolar, "DEFAULT");
+  }
+  
+  Serial.printf("[POLAR] Loaded %d polar files total\n", polarCount);
+  
+  // Debug: List all loaded polars
+  for (int i = 0; i < polarCount; i++) {
+    Serial.printf("[POLAR] %d: %s - %s (%s)\n", i, polars[i].name, polars[i].model, polarFilenames[i]);
+  }
+}
+
 static void updatePolarListCharacteristic() {
   if (!chPolarList) return;
   String polarList;
-  for (int i = 0; i < defaultPolarCount; i++) {
-    polarList += String(i) + ":" + defaultPolars[i].name + " - " + defaultPolars[i].model + "\n";
+  for (int i = 0; i < polarCount; i++) {
+    polarList += String(i) + ":" + polars[i].name + " - " + polars[i].model + "\n";
   }
   chPolarList->setValue(polarList.c_str());
+}
+
+// Startup sequence functions
+static void handleStartupSequence() {
+  if (startupComplete) return;
+  
+  uint32_t now = millis();
+  
+  switch (startupState) {
+    case STARTUP_SENSOR_CONNECTION:
+      // Phase 1: Wait for sensor connection
+      if (now - lastSensorCheck > 1000) { // Check every second
+        Serial.println("[STARTUP] Phase 1: Waiting for sensor connection...");
+        lastSensorCheck = now;
+      }
+      
+      // Check if sensor is connected (HELLO received)
+      if (sensorConnected) {
+        Serial.println("[STARTUP] Phase 1: Sensor connected, requesting polar data...");
+        startupState = STARTUP_DATA_LOADING;
+        dataLoadingStartTime = now;
+      }
+      break;
+      
+    case STARTUP_DATA_LOADING:
+      // Phase 1: Load polar data with progress tracking
+      if (!polarDataRequested) {
+        Serial.println("[STARTUP] Phase 1: Requesting polar data from sensor...");
+        // This will be triggered by the display sending GET_POLARS
+        polarDataRequested = true;
+      }
+      
+      // Check for timeout (30 seconds)
+      if (now - dataLoadingStartTime > 30000) {
+        Serial.println("[STARTUP] Phase 1: Data loading timeout, proceeding anyway...");
+        startupState = STARTUP_DATA_VALIDATION;
+      }
+      
+      // Check if data loading is complete
+      if (polarDataComplete) {
+        Serial.println("[STARTUP] Phase 1: Data loading complete, validating...");
+        startupState = STARTUP_DATA_VALIDATION;
+      }
+      break;
+      
+    case STARTUP_DATA_VALIDATION:
+      // Phase 1: Validate loaded data
+      Serial.printf("[STARTUP] Phase 1: Validating %d polars loaded...\n", polarCount);
+      if (polarCount > 0) {
+        Serial.println("[STARTUP] Phase 1: Data validation complete, starting Phase 2...");
+        startupState = STARTUP_QNH_ENTRY;
+      } else {
+        Serial.println("[STARTUP] Phase 1: No polars loaded, using default...");
+        startupState = STARTUP_QNH_ENTRY;
+      }
+      break;
+      
+    case STARTUP_QNH_ENTRY:
+      // Phase 2: User enters QNH (handled by display)
+      Serial.println("[STARTUP] Phase 2: Waiting for QNH entry from user...");
+      // This will be handled by the display sending SET,QNH command
+      break;
+      
+    case STARTUP_POLAR_SELECTION:
+      // Phase 2: User selects polar (handled by display)
+      Serial.println("[STARTUP] Phase 2: Waiting for polar selection from user...");
+      // This will be handled by the display sending SET,POLAR command
+      break;
+      
+    case STARTUP_COMPLETE:
+      startupComplete = true;
+      Serial.println("[STARTUP] Complete: Normal operation started");
+      break;
+  }
+}
+
+static void processQNHEntry(String qnh) {
+  if (qnh.length() == 4) {
+    int qnhValue = qnh.toInt();
+    if (qnhValue >= 950 && qnhValue <= 1050) {
+      cfg.qnhPa = qnhValue * 100; // Convert hPa to Pa
+      saveConfig();
+      Serial.printf("[STARTUP] Phase 2: QNH set to: %d hPa\n", qnhValue);
+      startupState = STARTUP_POLAR_SELECTION;
+    }
+  }
+}
+
+static void processPolarSelection(int index) {
+  if (index >= 0 && index < polarCount) {
+    selectedPolarIndex = index;
+    teComp.setPolar(&polars[selectedPolarIndex]);
+    Serial.printf("[STARTUP] Phase 2: Selected polar: %s %s\n", polars[selectedPolarIndex].name, polars[selectedPolarIndex].model);
+    startupState = STARTUP_COMPLETE;
+    startupComplete = true;
+  }
+}
+
+// CSV polar data functions
+static void sendPolarDataToDisplay(int index) {
+  if (index < 0 || index >= polarCount) return;
+  
+  const GliderPolar& polar = polars[index];
+  
+  // Build speed/sink data string
+  String data = "";
+  for (int i = 0; i < polar.point_count; i++) {
+    if (i > 0) data += ",";
+    data += String(polar.points[i].asi_kts, 1); // speed in knots
+    data += ",";
+    data += String(polar.points[i].sink_rate_ms, 2);  // sink rate in m/s
+  }
+  
+  // Send polar data to display
+  csv.sendPolarData(index, data.c_str());
+  Serial.printf("[CSV] Sent polar data for %s: %s\n", polar.name, data.c_str());
+}
+
+static void sendPolarListToDisplay() {
+  if (polarCount == 0) {
+    Serial.println("[CSV] No polars to send");
+    return;
+  }
+  
+  Serial.printf("[CSV] Sending %d polars to display...\n", polarCount);
+  
+  // Build comma-separated list of polar names
+  String polarList = "";
+  for (int i = 0; i < polarCount; i++) {
+    if (i > 0) polarList += ",";
+    polarList += polars[i].name;
+  }
+  
+  // Check if the message is too long for CSV buffer (1024 chars)
+  int messageLength = polarList.length() + 8; // +8 for "POLARS,"
+  Serial.printf("[CSV] Polar list message length: %d characters\n", messageLength);
+  
+  if (messageLength > 900) { // Leave some buffer for 1024 byte limit
+    Serial.printf("[CSV] WARNING: Polar list too long (%d chars), may be truncated!\n", messageLength);
+    Serial.printf("[CSV] First 200 chars: %.200s\n", polarList.c_str());
+  }
+  
+  // Send polar list to display
+  csv.sendPolars(polarList.c_str());
+  Serial.printf("[CSV] Sent polar list (%d polars)\n", polarCount);
+  
+  // Send polar data for each polar
+  Serial.printf("[CSV] Sending polar data for %d polars...\n", polarCount);
+  for (int i = 0; i < polarCount; i++) {
+    sendPolarDataToDisplay(i);
+    if (i % 10 == 0) { // Progress indicator every 10 polars
+      Serial.printf("[CSV] Sent polar data %d/%d\n", i+1, polarCount);
+    }
+  }
+  Serial.printf("[CSV] Completed sending all %d polar data sets\n", polarCount);
+}
+
+static void sendPolarDataChunkedToDisplay() {
+  if (polarCount == 0) {
+    Serial.println("[CSV] No polars to send");
+    return;
+  }
+  
+  Serial.printf("[CSV] Sending %d polars to display using chunked approach...\n", polarCount);
+  
+  // Build comma-separated list of polar names
+  String polarList = "";
+  for (int i = 0; i < polarCount; i++) {
+    if (i > 0) polarList += ",";
+    polarList += polars[i].name;
+  }
+  
+  // Send polar list to display in chunks (to avoid buffer overflow)
+  const int maxPolarsPerChunk = 20; // Send 20 polars per POLARS command
+  int sentPolars = 0;
+  
+  while (sentPolars < polarCount) {
+    String chunkList = "POLARS,";
+    int polarsInChunk = 0;
+    
+    for (int i = sentPolars; i < polarCount && polarsInChunk < maxPolarsPerChunk; i++) {
+      if (i > sentPolars) chunkList += ",";
+      chunkList += polars[i].name;
+      polarsInChunk++;
+    }
+    
+    csv.sendPolars(chunkList.c_str());
+    Serial.printf("[CSV] Sent polar list chunk (%d polars, %d-%d)\n", polarsInChunk, sentPolars, sentPolars + polarsInChunk - 1);
+    sentPolars += polarsInChunk;
+    
+    // Small delay between polar list chunks
+    delay(100);
+  }
+  
+  Serial.printf("[CSV] Sent complete polar list (%d polars in chunks)\n", polarCount);
+  
+  // Give display time to process the polar list
+  delay(1000); // 1 second delay after sending polar list
+  
+  // Send polar data in chunks of 3 polars each (reduced to prevent buffer overflow)
+  const int chunkSize = 3;
+  int totalChunks = (polarCount + chunkSize - 1) / chunkSize;
+  
+  Serial.printf("[CSV] Sending polar data in %d chunks of up to %d polars each...\n", totalChunks, chunkSize);
+  
+  for (int chunk = 0; chunk < totalChunks; chunk++) {
+    String chunkData = String(chunk + 1) + "," + String(totalChunks) + ",";
+    
+    int polarsInChunk = 0;
+    for (int i = 0; i < chunkSize && (chunk * chunkSize + i) < polarCount; i++) {
+      int polarIndex = chunk * chunkSize + i;
+      GliderPolar& polar = polars[polarIndex];
+      
+      // Add polar name
+      chunkData += String(polar.name) + ",";
+      
+      // Add speed/sink pairs
+      for (int j = 0; j < polar.point_count; j++) {
+        chunkData += String(polar.points[j].asi_kts, 1) + ",";
+        chunkData += String(polar.points[j].sink_rate_ms, 2) + ",";
+      }
+      
+      polarsInChunk++;
+    }
+    
+    // Remove trailing comma
+    if (chunkData.endsWith(",")) {
+      chunkData = chunkData.substring(0, chunkData.length() - 1);
+    }
+    
+    // Check message length
+    int messageLength = chunkData.length() + 17; // +17 for "POLAR_DATA_CHUNK,"
+    Serial.printf("[CSV] Chunk %d/%d: %d polars, %d chars\n", 
+                  chunk + 1, totalChunks, polarsInChunk, messageLength);
+    
+    if (messageLength > 1900) { // Leave some buffer for 2048 byte limit
+      Serial.printf("[CSV] WARNING: Chunk %d too long (%d chars), may be truncated!\n", 
+                    chunk + 1, messageLength);
+    }
+    
+    // Send chunk
+    csv.sendPolarDataChunk(chunkData.c_str());
+    Serial.printf("[CSV] Sent chunk %d/%d, waiting for processing...\n", chunk + 1, totalChunks);
+    
+    // Longer delay between chunks to ensure reliable processing
+    delay(500); // 500ms delay between chunks for reliable transfer
+  }
+  
+  Serial.printf("[CSV] Completed sending all %d polars in %d chunks\n", polarCount, totalChunks);
 }
 
 static void bleUpdateStateChar() {
@@ -885,7 +1405,7 @@ static void setupBLE() {
   Serial.println("[BLE] Setting power level...");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);           // max practical TX power
   Serial.println("[BLE] Power level set");
-  
+
   Serial.println("[BLE] Disabling security...");
   NimBLEDevice::setSecurityAuth(false, false, false); // Disable security for easier connection
   Serial.println("[BLE] Security disabled");
@@ -1156,25 +1676,31 @@ void setup(){
   delay(100);
   Serial.println("\n=== Boot: ESP32-S3 Mini SENSOR (CSV link over UART1 44/43) ===");
 
-  // Polars / config
-  for (int i=0;i<defaultPolarCount;i++) polars[i]=defaultPolars[i];
+  // Initialize SD card first for polar file scanning
+  setupSD();
+
+  // Scan for polar files on SD card
+  scanPolarFiles();
 
   // Load persisted cfg (if present) before using fields
   loadConfig();
 
-  // Ensure TEComp uses the persisted polar selection
+  // --- Initialize startup sequence ---
+  startupState = STARTUP_QNH_ENTRY;
+  startupComplete = false;
+  selectedPolarIndex = 0;
+
+  // Ensure TEComp uses the persisted polar selection (will be changed in startup sequence)
   {
     int idx = (int)cfg.selectedPolarIndex;
-    if (idx < 0 || idx >= defaultPolarCount) idx = 0;
+    if (idx < 0 || idx >= polarCount) idx = 0;
     teComp.setPolar(&polars[idx]);
+    Serial.printf("[SETUP] Default polar: %s (index %d)\n", polars[idx].name, idx);
   }
 
   setupBMP581();
   setupGPS();
   primeGPS(1200);
-  
-  // Initialize SD card for IGC logging
-  setupSD();
 
   // Use persisted QNH if you later switch to STARTUP_QNH_MODE==0
   seaLevelPa = 101325.0f;
@@ -1185,8 +1711,11 @@ void setup(){
   Serial.printf("[LINK] UART1 CSV  RX=%d  TX=%d @115200\n", PIN_LINK_RX, PIN_LINK_TX);
 
   // Optional: greet the display
+  Serial.println("[CSV] Sending HELLO,SENSOR to display...");
   csv.sendHelloSensor(); delay(10);
+  Serial.println("[CSV] Sending second HELLO,SENSOR to display...");
   csv.sendHelloSensor(); delay(10);
+  Serial.println("[CSV] HELLO messages sent");
 
   // Wire sensor-side handlers (Display -> Sensor "SET,...")
   csv.onSetTE    = [&](bool en){
@@ -1194,16 +1723,28 @@ void setup(){
     Serial.printf("[SET] TE=%d\n", en);
   };
   csv.onSetPolar = [&](int idx){
-    if(idx>=0 && idx<defaultPolarCount){
+    if(idx>=0 && idx<polarCount){
       cfg.selectedPolarIndex = (uint8_t)idx;
       teComp.setPolar(&polars[idx]); saveConfig();
-      Serial.printf("[SET] POLAR=%s\n", polars[idx].name);
+      Serial.printf("[SET] POLAR=%s (index %d)\n", polars[idx].name, idx);
+      
+      // If in startup sequence Phase 2, process the selection
+      if (!startupComplete && startupState == STARTUP_POLAR_SELECTION) {
+        processPolarSelection(idx);
+      }
+    } else {
+      Serial.printf("[SET] Invalid polar index: %d (max: %d)\n", idx, polarCount - 1);
     }
   };
   csv.onSetQNH   = [&](uint32_t pa){
     if(pa>80000 && pa<110000){
       cfg.qnhPa = pa; seaLevelPa=(float)pa; saveConfig();
       Serial.printf("[SET] QNH=%u\n", pa);
+      
+      // If in startup sequence Phase 2, process the QNH entry
+      if (!startupComplete && startupState == STARTUP_QNH_ENTRY) {
+        processQNHEntry(String(pa / 100)); // Convert Pa to hPa
+      }
     }
   };
   csv.onSetVol   = [&](uint8_t v){
@@ -1213,6 +1754,16 @@ void setup(){
   csv.onSetBri   = [&](uint8_t v){
     if(v>10)v=10; cfg.displayBrightness = v; saveConfig();
     Serial.printf("[SET] BRI=%u\n", v);
+  };
+  csv.onGetPolars = [&](){
+    Serial.println("[CSV] *** GET_POLARS request received from display ***");
+    sendPolarDataChunkedToDisplay(); // Use chunked approach for better reliability
+    polarDataComplete = true; // Mark data loading as complete
+  };
+  csv.onHelloSensor = [&](){
+    Serial.println("[CSV] *** Display connected - Phase 1 sensor connection established ***");
+    csv.sendAck("HELLO", 1);
+    sensorConnected = true; // Mark sensor as connected
   };
 
   // === BLE ===
@@ -1229,7 +1780,39 @@ void setup(){
 
 void loop(){
   handleOTA();          // Handle WiFi OTA updates if active
+  
+  // Always poll CSV communication (even during startup)
   csv.poll();           // handle inbound SET/PING/PONG
+  
+  // Debug CSV communication
+  static uint32_t lastCsvDebug = 0;
+  static uint32_t lastPing = 0;
+  if (millis() - lastCsvDebug > 5000) {
+    Serial.printf("[CSV] Polling for data... (available: %d)\n", LinkUart.available());
+    lastCsvDebug = millis();
+  }
+  
+  // Send periodic ping to test communication
+  if (millis() - lastPing > 10000) {
+    Serial.println("[CSV] Sending test PING...");
+    csv.sendPing();
+    lastPing = millis();
+  }
+  
+  // Manual trigger for polar data (for testing) - disabled in new startup sequence
+  // static uint32_t lastPolarTest = 0;
+  // if (millis() - lastPolarTest > 30000) { // Every 30 seconds
+  //   Serial.println("[CSV] Manual polar data test - sending polar list...");
+  //   sendPolarListToDisplay();
+  //   lastPolarTest = millis();
+  // }
+  
+  // --- Handle startup sequence ---
+  if (!startupComplete) {
+    handleStartupSequence();
+    delay(100);
+    return;
+  }
   updateBaroKalman();
   pollGPS();
   

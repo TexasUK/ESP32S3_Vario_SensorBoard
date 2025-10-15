@@ -27,7 +27,8 @@ FlightCore is an advanced variometer system designed for gliding applications. I
 - **BLE interface** for wireless configuration from mobile devices
 - **Persistent settings** stored in NVS memory
 - **Real-time telemetry** via CSV protocol to display units
-- **Multiple glider polar curves** with automatic selection
+- **SD card polar files** - Load custom glider polar curves from .plr files
+- **Automatic polar scanning** - System scans /data folder for .plr files on startup
 
 ### 🔄 **Over-The-Air (OTA) Updates**
 - **BLE-triggered WiFi OTA** for wireless firmware updates
@@ -111,8 +112,17 @@ FlightCore is an advanced variometer system designed for gliding applications. I
 ### **BLE Configuration**
 - **Wireless setup** from mobile devices
 - **Real-time updates** of pilot, glider, and competition data
-- **Polar curve selection** and thermal compensation settings
-- **Audio and display preferences**
+- **Polar curve selection** from available .plr files and built-in defaults
+- **Thermal compensation settings** and audio/display preferences
+
+### **Polar File System**
+- **SD card storage** - Place .plr files in `/data` folder on SD card
+- **WinPilot format** - Compatible with standard .plr polar files
+- **Automatic scanning** - System loads all .plr files on startup
+- **Built-in defaults** - Includes LS8, DG-800, ASG-29, and Discus polars
+- **Single polar selection** - One polar active at a time
+- **Startup sequence** - QNH entry → Polar selection → Normal operation
+- **Display integration** - Touch screen vario can select polars via dropdown
 
 ### **OTA Update System**
 - **BLE command interface** - Write "START" to OTA characteristic to begin update mode
@@ -168,6 +178,41 @@ FlightCore is an advanced variometer system designed for gliding applications. I
 - **No WiFi network**: Check BLE connection and try writing "START" again
 - **Upload fails**: Ensure you're uploading a valid .bin file
 - **System crashes**: The new validation prevents crashes from invalid uploads
+
+## Polar File Management
+
+### **Creating Polar Files**
+1. **Create `/data` folder** on SD card (if it doesn't exist)
+2. **Add .plr files** using WinPilot format:
+   ```
+   *GliderName WinPilot POLAR file (w. LK8000 extension) : MassDryGross[kg], MaxWaterBallast[liters], Speed1[km/h], Sink1[m/s], Speed2, Sink2, Speed3, Sink3, WingArea[m2]
+   380,  0,  78.05,  -0.79, 124.03,  -1.97, 170.00,  -4.54,  17.50
+   ```
+3. **File naming**: Use descriptive names like `ASK13.plr`, `LS8.plr`, etc.
+4. **Restart system** to scan new polar files
+
+### **Polar File Format**
+- **Header line**: Starts with `*` and describes the format
+- **Data line**: Comma-separated values with speeds in km/h and sink rates in m/s
+- **Automatic conversion**: System converts km/h to knots and handles units
+- **Multiple points**: Supports up to 12 speed/sink rate pairs
+
+### **Startup Sequence**
+1. **QNH Entry**: Display shows numeric keyboard for 4-digit QNH entry (950-1050 hPa)
+2. **Polar Selection**: Display shows dropdown list of available polars
+3. **Normal Operation**: Vario screen appears and normal functionality begins
+
+### **Dynamic Polar Integration**
+- **Automatic data exchange**: Display requests polar data on connection
+- **Real-time polar list**: Sensor sends comma-separated polar names
+- **Performance data**: Each polar's speed/sink rate data sent separately
+- **CSV protocol**: `GET_POLARS`, `POLARS,name1,name2,...`, `POLAR_DATA,index,speed1,sink1,...`
+
+### **Selecting Polars**
+- **Startup sequence**: Choose polar during initial setup
+- **Display unit**: Send CSV command `SET,POLAR,<index>` to select polar
+- **BLE app**: Read Polar List characteristic to see available polars
+- **Automatic loading**: Selected polar is used immediately for airspeed calculations
 
 ## Support
 
