@@ -4,6 +4,8 @@
 
 FlightCore is an advanced variometer system designed for gliding applications. It combines multiple sensors to provide accurate flight data, automatic flight logging, and intelligent airspeed calculation using glider polar curves and wind drift compensation.
 
+![IMG_20251026_025933](https://github.com/user-attachments/assets/fc6e1323-83c1-452a-b9d2-5f26957bfd24)
+
 ## Key Features
 
 ### 🛩️ **Intelligent Flight Detection**
@@ -45,6 +47,8 @@ FlightCore is an advanced variometer system designed for gliding applications. I
 3. **Configuration loading** - Restore pilot and glider settings
 4. **BLE advertising** - Start "FlightCore" service for mobile configuration
 5. **Boot logging** - Write system status to SD card
+6. 
+![IMG_20251026_025921](https://github.com/user-attachments/assets/ba5bff9c-1354-4f6c-b733-ac64ea2401c6)
 
 ### **Flight Detection Logic**
 - **Ground phase**: No flight detection, system monitors sensors
