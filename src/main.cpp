@@ -15,6 +15,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <FS.h>
 #include <SdFat.h>
 #include "Adafruit_BMP5xx.h"
 #include <TinyGPSPlus.h>
@@ -56,8 +57,8 @@ static constexpr int PIN_SD_CS     = 11;
 
 // -------------------- Options --------------------
 #define STARTUP_QNH_MODE   1
-#define SPEED_KTS_START    20.0f
-#define SPEED_KTS_STOP     20.0f
+#define SPEED_KTS_START    22.0f
+#define SPEED_KTS_STOP     18.0f
 #define START_DEBOUNCE_MS  3000
 #define STOP_DEBOUNCE_MS   10000
 
@@ -69,7 +70,7 @@ HardwareSerial  GPSSerial(2);  // UART2 (GPS on pins 4/5)
 HardwareSerial  LinkUart(1);   // UART1 (Display link on pins 44/43)
 CsvSerial       csv(LinkUart, PIN_LINK_RX, PIN_LINK_TX, 115200);
 
-SdFat           sd;
+SdFs            sd;
 FsFile          igc;
 bool            sdMounted = false;
 bool            igcLogging = false;
@@ -271,7 +272,7 @@ static void setupBMP581(){
   Serial.println(F("[BMP581] OK"));
 }
 static void updateBaroKalman(){
-  static int warm=10; static uint32_t lastDbg=0;
+  static int warm=10;
   if (!bmp.performReading()) return;
   if (warm-- > 0) return;
   lastPressPa = toPa(bmp.readPressure());
@@ -279,7 +280,6 @@ static void updateBaroKalman(){
   float dt = (lastBaroMs==0) ? 0.02f : (now-lastBaroMs)/1000.0f;
   if (dt<0.001f) dt=0.001f; if (dt>0.2f) dt=0.2f;
   float a = baroAltFromPa(lastPressPa, seaLevelPa);
-  if (now-lastDbg > 4000){ Serial.printf("[BARO] pa=%.1f (hPa=%.1f) alt=%.2f dt=%.3f\n", lastPressPa, lastPressPa/100.0f, a, dt); lastDbg=now; }
   kf.predict(dt); kf.update(a);
 
   // Bias-learn when essentially still (and slow groundspeed)
@@ -303,7 +303,7 @@ static void setupGPS(){
 }
 static void pollGPS(){
   while (GPSSerial.available()) {
-    char c = GPSSerial.read();
+    char c = (char)GPSSerial.read();
     gps.encode(c);
     gpsBytes++;
   }
@@ -335,18 +335,13 @@ static void pollGPS(){
   }
 
   uint32_t now = millis();
-  if (now - lastGpsLog > 1000) {
-    Serial.printf("[GPS] bytes=%lu  locOK=%d altOK=%d spdOK=%d  sats=%u fix=%u\n",
-                  (unsigned long)gpsBytes, locOK, altOK, spdOK, (unsigned)sats, (unsigned)fix);
-    gpsBytes = 0;
-    lastGpsLog = now;
-  }
+  // No periodic GPS debug logging for low overhead
 }
 
 // -------------------- IGC Logging --------------------
 static void setupSD() {
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
-  if (!sd.begin(PIN_SD_CS, SD_SCK_MHZ(10))) {
+  if (!sd.begin(SdSpiConfig(PIN_SD_CS, SHARED_SPI, SD_SCK_MHZ(10)))) {
     Serial.println("[SD] Card not found or failed to initialize");
     sdMounted = false;
     return;
@@ -549,14 +544,6 @@ static float calculatePolarAirspeed(float vario) {
   
   float minSink = polar->min_sink_rate;
   float bestGlideSpeed = polar->best_glide_speed;
-  
-  // Debug polar values
-  static uint32_t lastPolarDebug = 0;
-  if (millis() - lastPolarDebug > 10000) {
-    Serial.printf("[POLAR] polar=%p, point_count=%d, minSink: %.2f m/s, bestGlide: %.1f kts\n", 
-                  polar, polar ? polar->point_count : 0, minSink, bestGlideSpeed);
-    lastPolarDebug = millis();
-  }
   
   // For now, use a simple approach: if descending, use best glide speed
   // If climbing, estimate based on climb rate
@@ -886,6 +873,7 @@ public:
 
 // Global callback object to ensure it persists
 static CfgWriteCB g_cfgCallback;
+static ServerCallbacks g_serverCallbacks; // avoid heap allocation
 
 // Minimal line reader for SdFat FsFile (since readStringUntil may not be available)
 static bool fsReadLine(FsFile &file, String &out) {
@@ -917,6 +905,16 @@ static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
   
   while (pointCount < 12 && fsReadLine(file, line)) {
     line.trim();
+    // Strip UTF-8 BOM if present
+    if (line.length() >= 3 && (uint8_t)line[0] == 0xEF && (uint8_t)line[1] == 0xBB && (uint8_t)line[2] == 0xBF) {
+      line = line.substring(3);
+    }
+    // Remove inline comments after ';' or '//' if present
+    int sc = line.indexOf(';');
+    if (sc >= 0) line = line.substring(0, sc);
+    int dsl = line.indexOf("//");
+    if (dsl >= 0) line = line.substring(0, dsl);
+    line.trim();
     
     // Skip empty lines and comments
     if (line.length() == 0 || line.startsWith("*") || line.startsWith("#")) {
@@ -927,8 +925,8 @@ static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
     if (line.indexOf(',') > 0) {
       // Parse the polar data line
       // Format: MassDryGross[kg], MaxWaterBallast[liters], Speed1[km/h], Sink1[m/s], Speed2, Sink2, Speed3, Sink3, WingArea[m2]
-      float speeds[12] = {0};
-      float sinks[12]  = {0};
+      float speeds[12] = {0};   // m/s
+      float sinks[12]  = {0};   // m/s
       int pairs = 0;
 
       // Split by commas into tokens
@@ -954,15 +952,48 @@ static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
         }
       }
 
-      // Count complete pairs
+      // Count candidate pairs
       pairs = (tokenIndex - 2) / 2;
       if (pairs < 0) pairs = 0; if (pairs > 12) pairs = 12;
-      pointCount = pairs;
+
+      // Filter invalid values and compact
+      float fspeeds[12];
+      float fsinks[12];
+      int valid = 0;
+      for (int i = 0; i < pairs && valid < 12; i++) {
+        float sp = speeds[i];
+        float sk = sinks[i];
+        if (isnan(sp) || isnan(sk) || isinf(sp) || isinf(sk)) continue;
+        if (sp <= 0.1f || sp > 120.0f) continue;     // 0.1..120 m/s
+        if (fabsf(sk) > 15.0f) continue;             // -15..+15 m/s
+        fspeeds[valid] = sp;
+        fsinks[valid] = sk;
+        valid++;
+      }
+
+      // Require at least two points
+      if (valid < 2) {
+        continue;
+      }
+
+      // Sort by speed ascending (simple selection sort for small N)
+      for (int i = 0; i < valid - 1; i++) {
+        int minIdx = i;
+        for (int j = i + 1; j < valid; j++) {
+          if (fspeeds[j] < fspeeds[minIdx]) minIdx = j;
+        }
+        if (minIdx != i) {
+          float ts = fspeeds[i]; fspeeds[i] = fspeeds[minIdx]; fspeeds[minIdx] = ts;
+          float tk = fsinks[i];  fsinks[i]  = fsinks[minIdx];  fsinks[minIdx]  = tk;
+        }
+      }
+
+      pointCount = valid;
       
       // Convert speeds from m/s to knots and populate polar
       for (int i = 0; i < pointCount && i < 12; i++) {
-        polar->points[i].asi_kts = speeds[i] * 1.94384f; // m/s -> kts
-        polar->points[i].sink_rate_ms = sinks[i];        // m/s
+        polar->points[i].asi_kts = fspeeds[i] * 1.94384f; // m/s -> kts
+        polar->points[i].sink_rate_ms = fsinks[i];        // m/s
       }
       
       polar->point_count = pointCount;
@@ -987,7 +1018,7 @@ static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
   
   file.close();
   
-  if (foundData && pointCount > 0) {
+  if (foundData && pointCount > 1) {
     // Extract glider name from filename
     String fname = String(filename);
     int lastSlash = fname.lastIndexOf('/');
@@ -1101,17 +1132,17 @@ static void scanPolarFiles() {
   
   int filesFound = 0;
   FsFile file;
-  while (file = dir.openNextFile()) {
+  while (file.openNext(&dir, O_RDONLY)) {
     if (!file.isDirectory()) {
       char filename[64];
       file.getName(filename, sizeof(filename));
       String filenameStr = String(filename);
       Serial.printf("[POLAR] Found file: %s\n", filename);
-      
+
       if (filenameStr.endsWith(".plr")) {
-        String fullPath = "/data/" + filenameStr;
+        String fullPath = String("/data/") + filenameStr;
         Serial.printf("[POLAR] Processing .plr file: %s\n", fullPath.c_str());
-        
+
         // Load the polar file
         GliderPolar newPolar;
         if (loadPolarFromFile(fullPath.c_str(), &newPolar)) {
@@ -1266,6 +1297,8 @@ static void sendPolarDataToDisplay(int index) {
   // Send polar data to display
   csv.sendPolarData(index, data.c_str());
   Serial.printf("[CSV] Sent polar data for %s: %s\n", polar.name, data.c_str());
+  // Keep GPS fed during heavy CSV activity
+  pollGPS();
 }
 
 static void sendPolarListToDisplay() {
@@ -1303,6 +1336,8 @@ static void sendPolarListToDisplay() {
     if (i % 10 == 0) { // Progress indicator every 10 polars
       Serial.printf("[CSV] Sent polar data %d/%d\n", i+1, polarCount);
     }
+    // Service GPS while iterating
+    pollGPS();
   }
   Serial.printf("[CSV] Completed sending all %d polar data sets\n", polarCount);
 }
@@ -1346,8 +1381,11 @@ static void sendPolarDataChunkedToDisplay() {
   
   Serial.printf("[CSV] Sent complete polar list (%d polars in chunks)\n", polarCount);
   
-  // Give display time to process the polar list
-  delay(1000); // 1 second delay after sending polar list
+  // Give display time to process the polar list, servicing GPS
+  {
+    uint32_t t0 = millis();
+    while (millis() - t0 < 1000) { pollGPS(); delay(10); }
+  }
   
   // Send polar data in chunks of 3 polars each (reduced to prevent buffer overflow)
   const int chunkSize = 3;
@@ -1394,8 +1432,11 @@ static void sendPolarDataChunkedToDisplay() {
     csv.sendPolarDataChunk(chunkData.c_str());
     Serial.printf("[CSV] Sent chunk %d/%d, waiting for processing...\n", chunk + 1, totalChunks);
     
-    // Longer delay between chunks to ensure reliable processing
-    delay(500); // 500ms delay between chunks for reliable transfer
+    // Longer delay between chunks while servicing GPS
+    {
+      uint32_t t0 = millis();
+      while (millis() - t0 < 500) { pollGPS(); delay(10); }
+    }
   }
   
   Serial.printf("[CSV] Completed sending all %d polars in %d chunks\n", polarCount, totalChunks);
@@ -1428,7 +1469,7 @@ static void setupBLE() {
   Serial.printf("[BLE] Server created: %p\n", bleServer);
   
   Serial.println("[BLE] Setting server callbacks...");
-  bleServer->setCallbacks(new ServerCallbacks());
+  bleServer->setCallbacks(&g_serverCallbacks);
   Serial.println("[BLE] Server callbacks set");
   
   Serial.println("[BLE] Creating service...");
@@ -1797,20 +1838,7 @@ void loop(){
   // Always poll CSV communication (even during startup)
   csv.poll();           // handle inbound SET/PING/PONG
   
-  // Debug CSV communication
-  static uint32_t lastCsvDebug = 0;
-  static uint32_t lastPing = 0;
-  if (millis() - lastCsvDebug > 5000) {
-    Serial.printf("[CSV] Polling for data... (available: %d)\n", LinkUart.available());
-    lastCsvDebug = millis();
-  }
-  
-  // Send periodic ping to test communication
-  if (millis() - lastPing > 10000) {
-    Serial.println("[CSV] Sending test PING...");
-    csv.sendPing();
-    lastPing = millis();
-  }
+  // Debug CSV communication disabled for low overhead
   
   // Manual trigger for polar data (for testing) - disabled in new startup sequence
   // static uint32_t lastPolarTest = 0;
@@ -1822,6 +1850,8 @@ void loop(){
   
   // --- Handle startup sequence ---
   if (!startupComplete) {
+    // Keep reading GPS continuously during startup so fix can be acquired
+    pollGPS();
     handleStartupSequence();
     delay(100);
     return;
@@ -1839,13 +1869,7 @@ void loop(){
       float calculatedAirspeed = calculateAirspeed(gpsSpeed, vario_mps);
       calculateWind();
       
-      // Debug output for airspeed calculation
-      static uint32_t lastDebugMs = 0;
-      if (millis() - lastDebugMs > 5000) {
-        Serial.printf("[DEBUG] Vario: %.2f m/s, GPS: %.1f kts, AS: %.1f kts\n", 
-                      vario_mps, gpsSpeed, calculatedAirspeed);
-        lastDebugMs = millis();
-      }
+      // Debug output disabled for low overhead
       
       // Use calculated airspeed for display
       asi_kts = calculatedAirspeed;
@@ -1853,12 +1877,7 @@ void loop(){
       // Not moving - use GPS speed as airspeed
       asi_kts = gpsSpeed;
       
-      // Debug output for stationary state
-      static uint32_t lastDebugMs = 0;
-      if (millis() - lastDebugMs > 5000) {
-        Serial.printf("[DEBUG] Stationary: GPS: %.1f kts, AS: %.1f kts\n", gpsSpeed, asi_kts);
-        lastDebugMs = millis();
-      }
+      // Debug output disabled for low overhead
     }
   } else {
     // No GPS speed - set airspeed to 0
@@ -1930,16 +1949,7 @@ void loop(){
     lastTelemMs = now;
   }
 
-  // Debug heartbeat
-  static uint32_t lastPrint=0;
-  if (now - lastPrint >= 1000){
-    const char* modeNames[] = {"CRUISE", "THERMAL", "CLIMB", "DESCENT"};
-    Serial.printf("[TLM] netto=%.2f te=%.2f alt=%.1f as=%.1fkt gs=%.1fkt mode=%s conf=%.1f fix=%u sats=%u\n",
-                  vario_mps, teComp.compensate(vario_mps, asi_kts), alt_m, asi_kts, 
-                  gps.speed.isValid() ? gps.speed.knots() : 0.0f,
-                  modeNames[airspeedData.mode], airspeedData.confidence, (unsigned)fix, (unsigned)sats);
-    lastPrint = now;
-  }
+  // Debug heartbeat disabled for low overhead
 
   // Periodic BLE advertising check (every 30 seconds)
   static uint32_t lastBLECheck = 0;
