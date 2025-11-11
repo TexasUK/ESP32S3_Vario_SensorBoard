@@ -431,14 +431,11 @@ static void logIgcRecord() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return;
   
-  // Format B record: BHHMMSSDDMMMMNNDDDMMMMMEE
-  // B = record type
-  // HHMMSS = time
-  // DDMMMMN = latitude (DDMM.MMMN)
-  // DDDMMMMM = longitude (DDDMM.MMME)
-  // E = pressure altitude (3 digits)
-  // E = GPS altitude (3 digits)
-  // E = vario (2 digits)
+  // Format standard IGC B record:
+  // BHHMMSSDDMMmmmNDDDMMmmmAxxxxxYYYYY
+  // - A/V flag from GPS fix (A = valid)
+  // - xxxxx = pressure altitude (meters, 5 digits, 00000-99999)
+  // - YYYYY = GPS altitude (meters, 5 digits, 00000-99999)
   
   double lat = gps.location.lat();
   double lon = gps.location.lng();
@@ -446,39 +443,40 @@ static void logIgcRecord() {
   double pressAlt = alt_m;
   double vario = vario_mps;
   
-  // Convert to IGC format
+  // Convert to IGC format components
   int latDeg = abs((int)lat);
-  double latMin = (abs(lat) - latDeg) * 60.0;
-  int latMinInt = (int)latMin;
-  int latMinFrac = (int)((latMin - latMinInt) * 1000);
+  double alat = fabs(lat);
+  double latMin = (alat - latDeg) * 60.0;
+  int latMinInt = (int)latMin;                   // 2 digits
+  int latMinFrac = (int)((latMin - latMinInt) * 1000.0 + 0.5); // 3 digits, rounded
+  if (latMinFrac >= 1000) { latMinFrac = 0; latMinInt += 1; }
   char latNS = (lat >= 0) ? 'N' : 'S';
-  
+
   int lonDeg = abs((int)lon);
-  double lonMin = (abs(lon) - lonDeg) * 60.0;
-  int lonMinInt = (int)lonMin;
-  int lonMinFrac = (int)((lonMin - lonMinInt) * 1000);
+  double alon = fabs(lon);
+  double lonMin = (alon - lonDeg) * 60.0;
+  int lonMinInt = (int)lonMin;                   // 2 digits
+  int lonMinFrac = (int)((lonMin - lonMinInt) * 1000.0 + 0.5); // 3 digits, rounded
+  if (lonMinFrac >= 1000) { lonMinFrac = 0; lonMinInt += 1; }
   char lonEW = (lon >= 0) ? 'E' : 'W';
+
+  // Validity flag from GPS
+  char validFlag = (fix > 0) ? 'A' : 'V';
+
+  // Clamp altitudes to 0..99999
+  int pressAlt_i = (int)round(pressAlt);
+  if (pressAlt_i < 0) pressAlt_i = 0; if (pressAlt_i > 99999) pressAlt_i = 99999;
+  int gpsAlt_i = (int)round(gpsAlt);
+  if (gpsAlt_i < 0) gpsAlt_i = 0; if (gpsAlt_i > 99999) gpsAlt_i = 99999;
   
-  // Format the B record - IGC standard format
-  // BHHMMSSDDMMMMNNDDDMMMMMEE
-  // B = record type
-  // HHMMSS = time (UTC)
-  // DDMMMMN = latitude (DDMM.MMMN)
-  // DDDMMMMM = longitude (DDDMM.MMME)
-  // E = pressure altitude (3 digits, meters)
-  // E = GPS altitude (3 digits, meters)  
-  // E = vario (2 digits, 0.1 m/s units)
-  
+  // Assemble standard B record
   char bRecord[64];
-  snprintf(bRecord, sizeof(bRecord), 
-           "B%02d%02d%02d%02d%05d%c%03d%05d%c%03d%03d%02d",
+  snprintf(bRecord, sizeof(bRecord),
+           "B%02d%02d%02d%02d%02d%03d%c%03d%02d%03d%c%c%05d%05d",
            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
-           latDeg, latMinFrac, latNS,
-           lonDeg, lonMinFrac, lonEW,
-           (int)(pressAlt + 1000) % 1000,  // Pressure altitude (3 digits)
-           (int)(gpsAlt + 1000) % 1000,    // GPS altitude (3 digits)
-           (int)(vario * 10 + 50) % 100    // Vario (2 digits, scaled)
-  );
+           latDeg, latMinInt, latMinFrac, latNS,
+           lonDeg, lonMinInt, lonMinFrac, lonEW,
+           validFlag, pressAlt_i, gpsAlt_i);
   
   igc.println(bRecord);
   igc.flush(); // Ensure data is written
@@ -889,6 +887,20 @@ public:
 // Global callback object to ensure it persists
 static CfgWriteCB g_cfgCallback;
 
+// Minimal line reader for SdFat FsFile (since readStringUntil may not be available)
+static bool fsReadLine(FsFile &file, String &out) {
+  out = "";
+  while (file.available()) {
+    int c = file.read();
+    if (c < 0) break;
+    if (c == '\r') continue;
+    if (c == '\n') return true;
+    out += (char)c;
+    if (out.length() > 512) return true; // safety cap
+  }
+  return out.length() > 0;
+}
+
 static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
   if (!sdMounted) return false;
   
@@ -903,8 +915,7 @@ static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
   bool foundData = false;
   int pointCount = 0;
   
-  while (file.available() && pointCount < 12) {
-    line = file.readStringUntil('\n');
+  while (pointCount < 12 && fsReadLine(file, line)) {
     line.trim();
     
     // Skip empty lines and comments
@@ -916,50 +927,52 @@ static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
     if (line.indexOf(',') > 0) {
       // Parse the polar data line
       // Format: MassDryGross[kg], MaxWaterBallast[liters], Speed1[km/h], Sink1[m/s], Speed2, Sink2, Speed3, Sink3, WingArea[m2]
-      int commaCount = 0;
-      int lastComma = 0;
-      float speeds[12], sinks[12];
-      
-      for (int i = 0; i < line.length(); i++) {
-        if (line.charAt(i) == ',') {
-          commaCount++;
-          if (commaCount >= 3) { // Start from Speed1
-            String value = line.substring(lastComma + 1, i);
-            value.trim();
-            float val = value.toFloat();
-            
-            if ((commaCount - 3) % 2 == 0) { // Even = speed
-              speeds[(commaCount - 3) / 2] = val / 3.6f; // Convert km/h to m/s, then to kts
-            } else { // Odd = sink
-              sinks[(commaCount - 3) / 2] = val; // Already in m/s
-            }
-            
-            if (commaCount >= 3 + (pointCount + 1) * 2) {
-              pointCount++;
+      float speeds[12] = {0};
+      float sinks[12]  = {0};
+      int pairs = 0;
+
+      // Split by commas into tokens
+      int start = 0;
+      int tokenIndex = 0;
+      for (int i = 0; i <= line.length(); i++) {
+        if (i == line.length() || line.charAt(i) == ',') {
+          String value = line.substring(start, i);
+          value.trim();
+          // tokens from index 0: Mass, 1: MaxWB, 2: Speed1, 3: Sink1, 4: Speed2, 5: Sink2, ...
+          if (tokenIndex >= 2) {
+            int idx = tokenIndex - 2; // 0-based from Speed1
+            if ((idx % 2) == 0) {
+              int sp = idx / 2;
+              if (sp < 12) speeds[sp] = value.toFloat() / 3.6f; // km/h -> m/s
+            } else {
+              int sk = idx / 2;
+              if (sk < 12) sinks[sk] = value.toFloat();
             }
           }
-          lastComma = i;
+          tokenIndex++;
+          start = i + 1;
         }
       }
+
+      // Count complete pairs
+      pairs = (tokenIndex - 2) / 2;
+      if (pairs < 0) pairs = 0; if (pairs > 12) pairs = 12;
+      pointCount = pairs;
       
       // Convert speeds from m/s to knots and populate polar
       for (int i = 0; i < pointCount && i < 12; i++) {
-        polar->points[i].asi_kts = speeds[i] * 1.94384f; // m/s to knots
-        polar->points[i].sink_rate_ms = sinks[i];
+        polar->points[i].asi_kts = speeds[i] * 1.94384f; // m/s -> kts
+        polar->points[i].sink_rate_ms = sinks[i];        // m/s
       }
       
       polar->point_count = pointCount;
       
       // Calculate min sink and best glide
       if (pointCount > 0) {
+        // Define min sink as the lowest (most negative) value.
         polar->min_sink_rate = sinks[0];
         polar->best_glide_speed = speeds[0] * 1.94384f;
-        
         for (int i = 1; i < pointCount; i++) {
-          if (sinks[i] > polar->min_sink_rate) {
-            polar->min_sink_rate = sinks[i];
-          }
-          // Find best glide (lowest sink rate)
           if (sinks[i] < polar->min_sink_rate) {
             polar->min_sink_rate = sinks[i];
             polar->best_glide_speed = speeds[i] * 1.94384f;
@@ -1636,10 +1649,10 @@ static void startWiFiOTA() {
   otaMode = true;
   otaStartTime = millis();
   
-  // Notify via BLE
-  if (chState) {
-    chState->setValue("OTA_MODE");
-    chState->notify();
+  // Notify via BLE (use OTA characteristic for textual status)
+  if (chOTA) {
+    chOTA->setValue("OTA_MODE");
+    chOTA->notify();
   }
 }
 
@@ -1907,7 +1920,7 @@ void loop(){
 
     // If we're below 20 kts, force zeros; otherwise use Kalman vario
     float netto = tooSlow ? 0.0f : vario_mps;
-    float te_v  = tooSlow ? 0.0f : teComp.compensate(vario_mps, asi_kts);
+    float te_v  = tooSlow ? 0.0f : (cfg.teCompEnabled ? teComp.compensate(vario_mps, asi_kts) : netto);
 
     // small deadband
     if (fabsf(netto) < V_DEADBAND) netto = 0.0f;
