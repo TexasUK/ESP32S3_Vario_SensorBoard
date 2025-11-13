@@ -998,15 +998,23 @@ static bool loadPolarFromFile(const char* filename, GliderPolar* polar) {
       
       polar->point_count = pointCount;
       
-      // Calculate min sink and best glide
+      // Calculate min sink (closest to zero) and best glide (max L/D)
       if (pointCount > 0) {
-        // Define min sink as the lowest (most negative) value.
-        polar->min_sink_rate = sinks[0];
-        polar->best_glide_speed = speeds[0] * 1.94384f;
+        polar->min_sink_rate = fsinks[0];
+        polar->best_glide_speed = fspeeds[0] * 1.94384f;
+        float bestLD = (fabsf(fsinks[0]) > 1e-4f) ? (fspeeds[0] / fabsf(fsinks[0])) : 0.0f;
+
         for (int i = 1; i < pointCount; i++) {
-          if (sinks[i] < polar->min_sink_rate) {
-            polar->min_sink_rate = sinks[i];
-            polar->best_glide_speed = speeds[i] * 1.94384f;
+          if (fsinks[i] > polar->min_sink_rate) {
+            polar->min_sink_rate = fsinks[i];
+          }
+          float sinkAbs = fabsf(fsinks[i]);
+          if (sinkAbs > 1e-4f) {
+            float ld = fspeeds[i] / sinkAbs;
+            if (ld > bestLD) {
+              bestLD = ld;
+              polar->best_glide_speed = fspeeds[i] * 1.94384f;
+            }
           }
         }
       }
